@@ -13,8 +13,12 @@
 %   - A 140 mm x 140 mm square centered on the target is judged as a hit.
 %   - The camera can detect the target only during the descending phase.
 %
-% The trajectory is propagated with gravity. The default speed is computed
-% from the same-plane ballistic range equation for the nominal static target.
+% The trajectory is propagated with gravity and closed-loop guidance
+% acceleration. The default speed is computed from the same-plane ballistic
+% range equation for the nominal static target.
+% Guidance commands are updated only on camera frames and held constant until
+% the next camera frame. Actual overload follows the held command through a
+% first-order response and slew-rate limit, so acceleration changes smoothly.
 %
 % Run from MATLAB:
 %   run('matlab/simulate_guidance_algorithm.m')
@@ -29,7 +33,7 @@ cfg = default_guidance_config();
 scene = default_launch_scene();
 cfg.closing_velocity = scene.launch_speed_mps;
 
-dt = 0.01;
+dt = 1.0 / scene.physics_update_rate_hz;
 t_end = scene.sim_time_s;
 t = 0:dt:t_end;
 if t(end) < t_end
@@ -37,92 +41,70 @@ if t(end) < t_end
 end
 n = numel(t);
 
-[true_x, true_y, scene_log] = build_launch_scene_pixels(t, cfg, scene);
-hit_result = evaluate_hit_result(t, scene_log, scene);
-
 noise_sigma_px = scene.measurement_noise_sigma_px;
-meas_x = true_x + noise_sigma_px * randn(size(true_x));
-meas_y = true_y + noise_sigma_px * randn(size(true_y));
-
-valid_pixel = true_x >= 0.0 & true_x <= cfg.image_width & true_y >= 0.0 & true_y <= cfg.image_height;
-valid_meas = scene_log.camera_enabled & valid_pixel & ...
-    meas_x >= 0.0 & meas_x <= cfg.image_width & ...
-    meas_y >= 0.0 & meas_y <= cfg.image_height;
-meas_x(~valid_meas) = -1.0;
-meas_y(~valid_meas) = -1.0;
-
 roll_deg = zeros(size(t));
-roll_rad = deg2rad_local(roll_deg);
-
 gyro_b = zeros(3, n);
 
-state = init_guidance_state();
-sim = init_sim_log(n);
+[true_x, true_y, meas_x, meas_y, scene_log, sim, hit_result] = ...
+    run_closed_loop_simulation(t, cfg, scene, noise_sigma_px);
 
-for k = 1:n
-    [out, state] = guidance_step( ...
-        meas_x(k), ...
-        meas_y(k), ...
-        dt, ...
-        roll_rad(k), ...
-        gyro_b(:, k), ...
-        state, ...
-        cfg);
-
-    sim.detected(k) = out.detected;
-    sim.pixel_error_x(k) = out.pixel_error_x;
-    sim.pixel_error_y(k) = out.pixel_error_y;
-    sim.yaw_angle(k) = out.yaw_los_angle_rad;
-    sim.pitch_angle(k) = out.pitch_los_angle_rad;
-    sim.yaw_rate(k) = out.yaw_los_rate_rad_s;
-    sim.pitch_rate(k) = out.pitch_los_rate_rad_s;
-    sim.raw_yaw_angle(k) = out.raw_yaw_los_angle_rad;
-    sim.raw_pitch_angle(k) = out.raw_pitch_los_angle_rad;
-    sim.raw_yaw_rate(k) = out.raw_yaw_los_rate_rad_s;
-    sim.raw_pitch_rate(k) = out.raw_pitch_los_rate_rad_s;
-    sim.yaw_overload_g(k) = out.yaw_overload_g;
-    sim.pitch_overload_g(k) = out.pitch_overload_g;
-end
-
-valid = sim.detected > 0.5;
+valid = meas_x >= 0.0 & meas_y >= 0.0;
+pre_impact_mask = t <= hit_result.impact_time_s;
+display_valid = valid & pre_impact_mask;
 meas_x_plot = meas_x;
 meas_y_plot = meas_y;
-meas_x_plot(~valid) = NaN;
-meas_y_plot(~valid) = NaN;
+meas_x_plot(~display_valid) = NaN;
+meas_y_plot(~display_valid) = NaN;
 
-fprintf('Guidance simulation complete.\n');
-fprintf('Samples: %d, dt: %.3f s, valid detections: %d\n', n, dt, nnz(valid));
-fprintf('Launch pitch/yaw: %.1f deg / %.1f deg right, speed: %.2f m/s\n', ...
+fprintf('导引仿真完成。\n');
+fprintf('落地前显示采样点数：%d，积分步长：%.3f 秒，有效相机测量：%d\n', ...
+    nnz(pre_impact_mask), dt, nnz(display_valid));
+fprintf('动力学更新频率：%.1f Hz，相机帧率：%.1f Hz\n', ...
+    scene.physics_update_rate_hz, scene.camera_frame_rate_hz);
+fprintf('实际过载响应：时间常数 %.3f 秒，最大变化率 %.1f g/s\n', ...
+    scene.overload_response_time_constant_s, scene.overload_slew_rate_g_per_s);
+fprintf('场地方位：目标在物体右前方 %.1f 度，发射偏航正对目标 %.1f 度\n', ...
+    scene.target_bearing_right_deg, scene.launch_yaw_deg);
+fprintf('发射俯仰/偏航：%.1f 度 / 右偏 %.1f 度，速度：%.2f m/s\n', ...
     scene.launch_pitch_deg, scene.launch_yaw_deg, scene.launch_speed_mps);
-fprintf('Target forward distance: %.2f m, horizontal range: %.2f m, move time: %.3f s\n', ...
+fprintf('目标前向距离：%.2f m，水平距离：%.2f m，移动时间：%.3f 秒\n', ...
     scene.target_forward_distance_m, scene.target_horizontal_range_m, scene.target_move_time_s);
-fprintf('Nominal target position: forward %.2f m, right %.2f m, up %.2f m\n', ...
+fprintf('目标名义位置：前向 %.2f m，右向 %.2f m，上向 %.2f m\n', ...
     scene_log.target_nominal_world_m(1), scene_log.target_nominal_world_m(2), ...
     -scene_log.target_nominal_world_m(3));
-fprintf('Apex time: %.3f s, static-target hit time: %.3f s\n', ...
+fprintf('弹道最高点时间：%.3f 秒，静止目标无控命中时间：%.3f 秒\n', ...
     scene.apex_time_s, scene.nominal_static_hit_time_s);
-fprintf('Same-plane ballistic range: %.2f m, range error: %.3f mm\n', ...
+fprintf('同平面无控射程：%.2f m，射程误差：%.3f mm\n', ...
     scene.same_plane_ballistic_range_m, ...
     (scene.same_plane_ballistic_range_m - scene.target_horizontal_range_m) * 1000.0);
-fprintf('Target lateral start/final: %.0f mm -> %.0f mm\n', ...
+fprintf('目标横向移动：%.0f mm -> %.0f mm\n', ...
     scene.target_initial_lateral_m * 1000.0, scene.target_final_lateral_m * 1000.0);
-fprintf('Hit box: %.0f mm x %.0f mm\n', ...
+fprintf('弹目角控制增益：偏航 %.3f 1/s，俯仰 %.3f 1/s\n', ...
+    cfg.yaw_angle_control_gain + cfg.position_to_rate_gain, ...
+    cfg.pitch_angle_control_gain + cfg.position_to_rate_gain);
+fprintf('命中判定框：%.0f mm x %.0f mm\n', ...
     scene.hit_box_side_m * 1000.0, scene.hit_box_side_m * 1000.0);
-fprintf('Impact time: %.3f s, judgement: %s\n', ...
+fprintf('落点判定时间：%.3f 秒，判定结果：%s\n', ...
     hit_result.impact_time_s, hit_result.judgement);
-fprintf('Miss components: range %.1f mm, lateral %.1f mm, height %.1f mm\n', ...
+fprintf('脱靶分量：前后 %.1f mm，横向 %.1f mm（右为正），高度 %.1f mm\n', ...
     hit_result.range_error_m * 1000.0, ...
     hit_result.lateral_error_m * 1000.0, ...
     hit_result.height_error_m * 1000.0);
-fprintf('Center miss distance: %.1f mm, outside-box miss distance: %.1f mm\n', ...
+fprintf('中心脱靶量：%.1f mm，命中框外脱靶量：%.1f mm\n', ...
     hit_result.center_miss_m * 1000.0, hit_result.outside_box_miss_m * 1000.0);
-fprintf('Measurement noise sigma: %.2f px\n', noise_sigma_px);
-fprintf('Yaw overload range:   [%.3f, %.3f] g\n', min(sim.yaw_overload_g), max(sim.yaw_overload_g));
-fprintf('Pitch overload range: [%.3f, %.3f] g\n', min(sim.pitch_overload_g), max(sim.pitch_overload_g));
-fprintf('Output image: %s\n', make_output_path('guidance_simulation_result.png'));
-fprintf('Flight/hit image: %s\n', make_output_path('flight_hit_result.png'));
+fprintf('测量噪声标准差：%.2f 像素\n', noise_sigma_px);
+fprintf('偏航指令过载范围：   [%.3f, %.3f] g\n', ...
+    min(sim.yaw_overload_g(pre_impact_mask)), max(sim.yaw_overload_g(pre_impact_mask)));
+fprintf('俯仰指令过载范围：   [%.3f, %.3f] g\n', ...
+    min(sim.pitch_overload_g(pre_impact_mask)), max(sim.pitch_overload_g(pre_impact_mask)));
+fprintf('偏航实际过载范围：   [%.3f, %.3f] g\n', ...
+    min(sim.actual_yaw_overload_g(pre_impact_mask)), max(sim.actual_yaw_overload_g(pre_impact_mask)));
+fprintf('俯仰实际过载范围：   [%.3f, %.3f] g\n', ...
+    min(sim.actual_pitch_overload_g(pre_impact_mask)), max(sim.actual_pitch_overload_g(pre_impact_mask)));
+fprintf('导引结果图：%s\n', make_output_path('guidance_simulation_result.png'));
+fprintf('飞行/命中结果图：%s\n', make_output_path('flight_hit_result.png'));
 
-plot_simulation_result(t, true_x, true_y, meas_x_plot, meas_y_plot, scene_log, sim, cfg, scene);
+plot_simulation_result(t, true_x, true_y, meas_x_plot, meas_y_plot, scene_log, sim, cfg, scene, hit_result);
 plot_flight_hit_result(t, scene_log, scene, hit_result);
 save_simulation_data(t, true_x, true_y, meas_x, meas_y, roll_deg, gyro_b, scene_log, sim, cfg, scene, hit_result);
 
@@ -146,9 +128,11 @@ function cfg = default_guidance_config()
         0.0, 1.0, 0.0
     ];
 
-    cfg.navigation_ratio = 3.0;
-    cfg.closing_velocity = 15.0;
+    cfg.navigation_ratio = 0.0;
+    cfg.closing_velocity = 16.60;
     cfg.position_to_rate_gain = 0.0;
+    cfg.yaw_angle_control_gain = 2.0;
+    cfg.pitch_angle_control_gain = 2.0;
     cfg.rate_filter_alpha = NaN;
     cfg.use_kalman_filter = true;
 
@@ -156,10 +140,10 @@ function cfg = default_guidance_config()
     cfg.kalman_rate_variance = 1.0;
     cfg.kalman_process_angle_variance = 0.0001;
     cfg.kalman_process_rate_variance = 0.02;
-    cfg.kalman_measurement_angle_variance = 0.0025;
-    cfg.kalman_measurement_rate_variance = 10.0;
+    cfg.kalman_measurement_angle_variance = 3.3e-6;
+    cfg.kalman_measurement_rate_variance = 0.023;
 
-    cfg.max_overload_g = 6.0;
+    cfg.max_overload_g = 2.0;
     cfg.roll_compensation = true;
     cfg.roll_sign = 1.0;
 end
@@ -167,26 +151,34 @@ end
 function scene = default_launch_scene()
     scene.launch_pitch_deg = 35.0;
     scene.target_bearing_right_deg = 7.8;
-    scene.launch_yaw_deg = scene.target_bearing_right_deg;
     scene.target_forward_distance_m = 24.5;
     scene.target_lateral_limit_m = 0.280;
     scene.target_move_time_s = 0.600;
     scene.target_initial_lateral_m = 0.0;
     scene.target_final_lateral_m = (2.0 * rand() - 1.0) * scene.target_lateral_limit_m;
     scene.hit_box_side_m = 0.140;
-    scene.measurement_noise_sigma_px = 2.0;
+    scene.measurement_noise_sigma_px = 1.0;
 
     % Gravity is enabled so that camera detection can be gated by descent.
     scene.use_gravity = true;
     scene.gravity_mps2 = 9.80665;
     scene.camera_only_descending = true;
     scene.camera_aligns_with_velocity = true;
+    scene.physics_update_rate_hz = 240.0;
+    scene.camera_frame_rate_hz = 60.0;
+    scene.command_hold_between_frames = true;
+    scene.overload_response_time_constant_s = 0.060;
+    scene.overload_slew_rate_g_per_s = 120.0;
 
     pitch_rad = deg2rad_local(scene.launch_pitch_deg);
-    yaw_rad = deg2rad_local(scene.launch_yaw_deg);
-    scene.target_right_distance_m = scene.target_forward_distance_m * tan(yaw_rad);
-    scene.target_horizontal_range_m = ...
-        scene.target_forward_distance_m / cos(yaw_rad);
+    target_bearing_rad = deg2rad_local(scene.target_bearing_right_deg);
+    scene.target_right_distance_m = scene.target_forward_distance_m * tan(target_bearing_rad);
+    scene.target_horizontal_range_m = hypot( ...
+        scene.target_forward_distance_m, ...
+        scene.target_right_distance_m);
+    scene.launch_yaw_deg = rad2deg_local(atan2( ...
+        scene.target_right_distance_m, ...
+        scene.target_forward_distance_m));
     scene.launch_speed_mps = required_same_plane_speed( ...
         scene.target_horizontal_range_m, ...
         scene.launch_pitch_deg, ...
@@ -196,22 +188,222 @@ function scene = default_launch_scene()
     scene.nominal_static_hit_time_s = scene.same_plane_flight_time_s;
     scene.same_plane_ballistic_range_m = ...
         scene.launch_speed_mps * cos(pitch_rad) * scene.same_plane_flight_time_s;
-    scene.sim_time_s = scene.same_plane_flight_time_s;
+    scene.sim_time_s = 1.25 * scene.same_plane_flight_time_s;
 end
 
 function speed_mps = required_same_plane_speed(horizontal_range_m, launch_pitch_deg, gravity_mps2)
     pitch_rad = deg2rad_local(launch_pitch_deg);
     range_factor = sin(2.0 * pitch_rad);
     if range_factor <= 0.0
-        error('Launch pitch must satisfy 0 < pitch < 90 deg for same-plane range solving.');
+        error('发射俯仰角必须在 0 到 90 度之间，才能求解同平面无控射程。');
     end
     speed_mps = sqrt(horizontal_range_m * gravity_mps2 / range_factor);
 end
 
+function [true_x, true_y, meas_x, meas_y, log_data, sim, hit_result] = run_closed_loop_simulation(t, cfg, scene, noise_sigma_px)
+
+    n = numel(t);
+    true_x = -ones(1, n);
+    true_y = -ones(1, n);
+    meas_x = -ones(1, n);
+    meas_y = -ones(1, n);
+    sim = init_sim_log(n);
+    log_data = init_scene_log(n);
+
+    launch_R_wb = body_to_world_rotation(scene.launch_yaw_deg, scene.launch_pitch_deg);
+    target_nominal_w = [
+        scene.target_forward_distance_m;
+        scene.target_right_distance_m;
+        0.0
+    ];
+    log_data.target_nominal_world_m = target_nominal_w;
+    log_data.launch_R_wb = launch_R_wb;
+
+    projectile_w = [0.0; 0.0; 0.0];
+    velocity_w = launch_R_wb(:, 1) * scene.launch_speed_mps;
+    state = init_guidance_state();
+    held_out = lost_result();
+    actual_yaw_overload_g = 0.0;
+    actual_pitch_overload_g = 0.0;
+    next_camera_time = 0.0;
+    last_camera_time = NaN;
+    camera_period_s = 1.0 / scene.camera_frame_rate_hz;
+    time_eps = 1e-9;
+
+    for k = 1:n
+        target_lateral = target_lateral_motion(t(k), scene);
+        target_w = target_nominal_w + launch_R_wb(:, 2) * target_lateral;
+
+        if scene.camera_aligns_with_velocity
+            R_wb = body_to_world_from_velocity(velocity_w, scene.launch_yaw_deg);
+        else
+            R_wb = launch_R_wb;
+        end
+        R_bw = R_wb.';
+
+        rel_w = target_w - projectile_w;
+        rel_b = R_bw * rel_w;
+        body_pitch_deg = velocity_pitch_deg(velocity_w);
+        camera_enabled = ~scene.camera_only_descending || velocity_w(3) > 0.0;
+
+        if rel_b(1) > 0.0
+            [true_x(k), true_y(k)] = body_vector_to_pixel(rel_b, cfg);
+        end
+
+        is_camera_frame = t(k) + time_eps >= next_camera_time;
+        if is_camera_frame
+            while next_camera_time <= t(k) + time_eps
+                next_camera_time = next_camera_time + camera_period_s;
+            end
+
+            valid_true_pixel = true_x(k) >= 0.0 && true_x(k) <= cfg.image_width && ...
+                true_y(k) >= 0.0 && true_y(k) <= cfg.image_height;
+            if camera_enabled && valid_true_pixel
+                noisy_x = true_x(k) + noise_sigma_px * randn();
+                noisy_y = true_y(k) + noise_sigma_px * randn();
+                if noisy_x >= 0.0 && noisy_x <= cfg.image_width && ...
+                        noisy_y >= 0.0 && noisy_y <= cfg.image_height
+                    meas_x(k) = noisy_x;
+                    meas_y(k) = noisy_y;
+                end
+            end
+
+            if isnan(last_camera_time)
+                frame_dt = 0.0;
+            else
+                frame_dt = t(k) - last_camera_time;
+            end
+            last_camera_time = t(k);
+
+            [held_out, state] = guidance_step( ...
+                meas_x(k), ...
+                meas_y(k), ...
+                frame_dt, ...
+                0.0, ...
+                [0.0; 0.0; 0.0], ...
+                state, ...
+                cfg);
+        elseif ~scene.command_hold_between_frames
+            held_out = lost_result();
+        end
+
+        if k == 1
+            response_dt = 0.0;
+        else
+            response_dt = t(k) - t(k - 1);
+        end
+        [actual_yaw_overload_g, actual_pitch_overload_g] = update_actual_overload( ...
+            actual_yaw_overload_g, ...
+            actual_pitch_overload_g, ...
+            held_out.yaw_overload_g, ...
+            held_out.pitch_overload_g, ...
+            response_dt, ...
+            scene);
+
+        out = held_out;
+        sim = store_guidance_sample(sim, k, out, actual_yaw_overload_g, actual_pitch_overload_g);
+
+        control_accel_b = [
+            0.0;
+            actual_yaw_overload_g * cfg.G;
+            -actual_pitch_overload_g * cfg.G
+        ];
+        if scene.use_gravity
+            gravity_accel_w = [0.0; 0.0; scene.gravity_mps2];
+        else
+            gravity_accel_w = [0.0; 0.0; 0.0];
+        end
+        control_accel_w = R_wb * control_accel_b;
+        accel_w = gravity_accel_w + control_accel_w;
+
+        log_data.target_lateral_m(k) = target_lateral;
+        log_data.target_world_m(:, k) = target_w;
+        log_data.projectile_world_m(:, k) = projectile_w;
+        log_data.velocity_world_mps(:, k) = velocity_w;
+        log_data.accel_world_mps2(:, k) = accel_w;
+        log_data.control_accel_world_mps2(:, k) = control_accel_w;
+        log_data.vertical_velocity_down_mps(k) = velocity_w(3);
+        log_data.body_pitch_deg(k) = body_pitch_deg;
+        log_data.camera_enabled(k) = camera_enabled;
+        log_data.camera_frame(k) = is_camera_frame;
+        log_data.rel_b_m(:, k) = rel_b;
+        log_data.range_m(k) = sqrt(sum(rel_b .* rel_b));
+
+        if k < n
+            step_dt = t(k + 1) - t(k);
+            projectile_w = projectile_w + velocity_w * step_dt + 0.5 * accel_w * step_dt * step_dt;
+            velocity_w = velocity_w + accel_w * step_dt;
+        end
+    end
+
+    hit_result = evaluate_hit_result(t, log_data, scene);
+end
+
+function log_data = init_scene_log(n)
+    log_data.target_lateral_m = zeros(1, n);
+    log_data.target_world_m = zeros(3, n);
+    log_data.projectile_world_m = zeros(3, n);
+    log_data.velocity_world_mps = zeros(3, n);
+    log_data.accel_world_mps2 = zeros(3, n);
+    log_data.control_accel_world_mps2 = zeros(3, n);
+    log_data.vertical_velocity_down_mps = zeros(1, n);
+    log_data.body_pitch_deg = zeros(1, n);
+    log_data.camera_enabled = false(1, n);
+    log_data.camera_frame = false(1, n);
+    log_data.rel_b_m = zeros(3, n);
+    log_data.range_m = zeros(1, n);
+    log_data.target_nominal_world_m = zeros(3, 1);
+    log_data.launch_R_wb = eye(3);
+end
+
+function [actual_yaw_g, actual_pitch_g] = update_actual_overload( ...
+    current_yaw_g, current_pitch_g, command_yaw_g, command_pitch_g, dt, scene)
+
+    if dt <= 0.0
+        actual_yaw_g = current_yaw_g;
+        actual_pitch_g = current_pitch_g;
+        return;
+    end
+
+    tau = max(scene.overload_response_time_constant_s, 1e-6);
+    alpha = 1.0 - exp(-dt / tau);
+    target_yaw_g = current_yaw_g + alpha * (command_yaw_g - current_yaw_g);
+    target_pitch_g = current_pitch_g + alpha * (command_pitch_g - current_pitch_g);
+
+    max_delta_g = scene.overload_slew_rate_g_per_s * dt;
+    actual_yaw_g = current_yaw_g + clamp(target_yaw_g - current_yaw_g, -max_delta_g, max_delta_g);
+    actual_pitch_g = current_pitch_g + clamp(target_pitch_g - current_pitch_g, -max_delta_g, max_delta_g);
+end
+
+function sim = store_guidance_sample(sim, k, out, actual_yaw_overload_g, actual_pitch_overload_g)
+    sim.detected(k) = out.detected;
+    sim.pixel_error_x(k) = out.pixel_error_x;
+    sim.pixel_error_y(k) = out.pixel_error_y;
+    sim.yaw_angle(k) = out.yaw_los_angle_rad;
+    sim.pitch_angle(k) = out.pitch_los_angle_rad;
+    sim.yaw_rate(k) = out.yaw_los_rate_rad_s;
+    sim.pitch_rate(k) = out.pitch_los_rate_rad_s;
+    sim.raw_yaw_angle(k) = out.raw_yaw_los_angle_rad;
+    sim.raw_pitch_angle(k) = out.raw_pitch_los_angle_rad;
+    sim.raw_yaw_rate(k) = out.raw_yaw_los_rate_rad_s;
+    sim.raw_pitch_rate(k) = out.raw_pitch_los_rate_rad_s;
+    sim.yaw_rate_control_rad_s(k) = out.yaw_rate_control_rad_s;
+    sim.pitch_rate_control_rad_s(k) = out.pitch_rate_control_rad_s;
+    sim.yaw_angle_control_rad_s(k) = out.yaw_angle_control_rad_s;
+    sim.pitch_angle_control_rad_s(k) = out.pitch_angle_control_rad_s;
+    sim.yaw_command_rate_rad_s(k) = out.yaw_command_rate_rad_s;
+    sim.pitch_command_rate_rad_s(k) = out.pitch_command_rate_rad_s;
+    sim.yaw_overload_g(k) = out.yaw_overload_g;
+    sim.pitch_overload_g(k) = out.pitch_overload_g;
+    sim.actual_yaw_overload_g(k) = actual_yaw_overload_g;
+    sim.actual_pitch_overload_g(k) = actual_pitch_overload_g;
+end
+
 function hit_result = evaluate_hit_result(t, scene_log, scene)
-    impact_time_s = scene.nominal_static_hit_time_s;
+    impact_time_s = find_impact_time(t, scene_log, scene);
     projectile_w = interp_vector(t, scene_log.projectile_world_m, impact_time_s);
     target_w = interp_vector(t, scene_log.target_world_m, impact_time_s);
+    initial_target_w = scene_log.target_world_m(:, 1);
 
     yaw = deg2rad_local(scene.launch_yaw_deg);
     range_axis_w = [cos(yaw); sin(yaw); 0.0];
@@ -228,14 +420,15 @@ function hit_result = evaluate_hit_result(t, scene_log, scene)
     is_hit = abs(range_error_m) <= half_side_m && abs(lateral_error_m) <= half_side_m;
 
     if is_hit
-        judgement = 'HIT';
+        judgement = '命中';
     else
-        judgement = 'MISS';
+        judgement = '未命中';
     end
 
     hit_result.impact_time_s = impact_time_s;
     hit_result.projectile_world_m = projectile_w;
     hit_result.target_world_m = target_w;
+    hit_result.initial_target_world_m = initial_target_w;
     hit_result.error_world_m = error_w;
     hit_result.range_error_m = range_error_m;
     hit_result.lateral_error_m = lateral_error_m;
@@ -247,71 +440,31 @@ function hit_result = evaluate_hit_result(t, scene_log, scene)
     hit_result.judgement = judgement;
 end
 
-function value = interp_vector(t, values, query_t)
-    value = interp1(t(:), values.', query_t, 'linear', 'extrap').';
+function impact_time_s = find_impact_time(t, scene_log, scene)
+    height_error_down_m = scene_log.projectile_world_m(3, :) - scene_log.target_world_m(3, :);
+    for k = 2:numel(t)
+        descending = scene_log.vertical_velocity_down_mps(k) > 0.0;
+        crossed_target_plane = height_error_down_m(k - 1) < 0.0 && height_error_down_m(k) >= 0.0;
+        if descending && crossed_target_plane
+            dz = height_error_down_m(k) - height_error_down_m(k - 1);
+            if abs(dz) < 1e-12
+                impact_time_s = t(k);
+            else
+                ratio = -height_error_down_m(k - 1) / dz;
+                impact_time_s = t(k - 1) + ratio * (t(k) - t(k - 1));
+            end
+            return;
+        end
+    end
+
+    impact_time_s = t(end);
+    if scene_log.projectile_world_m(3, end) < scene_log.target_world_m(3, end)
+        warning('仿真结束前弹体未到达目标平面，使用最后一个采样点进行脱靶判定。');
+    end
 end
 
-function [pixel_x, pixel_y, log_data] = build_launch_scene_pixels(t, cfg, scene)
-    n = numel(t);
-    pixel_x = -ones(1, n);
-    pixel_y = -ones(1, n);
-
-    launch_R_wb = body_to_world_rotation(scene.launch_yaw_deg, scene.launch_pitch_deg);
-
-    target_lateral = target_lateral_motion(t, scene);
-    target_nominal_w = [
-        scene.target_forward_distance_m;
-        scene.target_right_distance_m;
-        0.0
-    ];
-    target_w = repmat(target_nominal_w, 1, n) + launch_R_wb(:, 2) * target_lateral;
-
-    initial_velocity_w = launch_R_wb(:, 1) * scene.launch_speed_mps;
-    projectile_w = initial_velocity_w * t;
-    velocity_w = initial_velocity_w * ones(1, n);
-
-    if scene.use_gravity
-        t2 = t .* t;
-        projectile_w(3, :) = projectile_w(3, :) + 0.5 * scene.gravity_mps2 * t2;
-        velocity_w(3, :) = velocity_w(3, :) + scene.gravity_mps2 * t;
-    end
-
-    rel_w = target_w - projectile_w;
-    rel_b = zeros(3, n);
-    camera_enabled = true(1, n);
-    body_pitch_deg = zeros(1, n);
-
-    for k = 1:n
-        if scene.camera_aligns_with_velocity
-            R_wb = body_to_world_from_velocity(velocity_w(:, k), scene.launch_yaw_deg);
-        else
-            R_wb = launch_R_wb;
-        end
-        R_bw = R_wb.';
-        rel_b(:, k) = R_bw * rel_w(:, k);
-        body_pitch_deg(k) = velocity_pitch_deg(velocity_w(:, k));
-        camera_enabled(k) = ~scene.camera_only_descending || velocity_w(3, k) > 0.0;
-
-        if rel_b(1, k) <= 0.0
-            continue;
-        end
-        if ~camera_enabled(k)
-            continue;
-        end
-        [pixel_x(k), pixel_y(k)] = body_vector_to_pixel(rel_b(:, k), cfg);
-    end
-
-    log_data.target_lateral_m = target_lateral;
-    log_data.target_world_m = target_w;
-    log_data.projectile_world_m = projectile_w;
-    log_data.velocity_world_mps = velocity_w;
-    log_data.vertical_velocity_down_mps = velocity_w(3, :);
-    log_data.body_pitch_deg = body_pitch_deg;
-    log_data.camera_enabled = camera_enabled;
-    log_data.target_nominal_world_m = target_nominal_w;
-    log_data.launch_R_wb = launch_R_wb;
-    log_data.rel_b_m = rel_b;
-    log_data.range_m = sqrt(sum(rel_b .* rel_b, 1));
+function value = interp_vector(t, values, query_t)
+    value = interp1(t(:), values.', query_t, 'linear', 'extrap').';
 end
 
 function target_y = target_lateral_motion(t, scene)
@@ -396,8 +549,16 @@ function sim = init_sim_log(n)
     sim.raw_pitch_angle = zeros(1, n);
     sim.raw_yaw_rate = zeros(1, n);
     sim.raw_pitch_rate = zeros(1, n);
+    sim.yaw_rate_control_rad_s = zeros(1, n);
+    sim.pitch_rate_control_rad_s = zeros(1, n);
+    sim.yaw_angle_control_rad_s = zeros(1, n);
+    sim.pitch_angle_control_rad_s = zeros(1, n);
+    sim.yaw_command_rate_rad_s = zeros(1, n);
+    sim.pitch_command_rate_rad_s = zeros(1, n);
     sim.yaw_overload_g = zeros(1, n);
     sim.pitch_overload_g = zeros(1, n);
+    sim.actual_yaw_overload_g = zeros(1, n);
+    sim.actual_pitch_overload_g = zeros(1, n);
 end
 
 function [out, state] = guidance_step(target_x, target_y, dt, roll_rad, gyro_b, state, cfg)
@@ -432,8 +593,14 @@ function [out, state] = guidance_step(target_x, target_y, dt, roll_rad, gyro_b, 
     [yaw_angle, yaw_dot, pitch_angle, pitch_dot, state] = ...
         filter_los_states(yaw_angle, yaw_dot, pitch_angle, pitch_dot, dt, state, cfg);
 
-    yaw_command_rate = yaw_dot + cfg.position_to_rate_gain * yaw_angle;
-    pitch_command_rate = pitch_dot + cfg.position_to_rate_gain * pitch_angle;
+    yaw_angle_gain = cfg.position_to_rate_gain + cfg.yaw_angle_control_gain;
+    pitch_angle_gain = cfg.position_to_rate_gain + cfg.pitch_angle_control_gain;
+    yaw_rate_control = yaw_dot;
+    pitch_rate_control = pitch_dot;
+    yaw_angle_control = yaw_angle_gain * yaw_angle;
+    pitch_angle_control = pitch_angle_gain * pitch_angle;
+    yaw_command_rate = yaw_rate_control + yaw_angle_control;
+    pitch_command_rate = pitch_rate_control + pitch_angle_control;
     yaw_overload_g = cfg.navigation_ratio * cfg.closing_velocity * yaw_command_rate / cfg.G;
     pitch_overload_g = cfg.navigation_ratio * cfg.closing_velocity * pitch_command_rate / cfg.G;
 
@@ -448,6 +615,12 @@ function [out, state] = guidance_step(target_x, target_y, dt, roll_rad, gyro_b, 
     out.raw_pitch_los_angle_rad = raw_pitch_angle;
     out.raw_yaw_los_rate_rad_s = raw_yaw_dot;
     out.raw_pitch_los_rate_rad_s = raw_pitch_dot;
+    out.yaw_rate_control_rad_s = yaw_rate_control;
+    out.pitch_rate_control_rad_s = pitch_rate_control;
+    out.yaw_angle_control_rad_s = yaw_angle_control;
+    out.pitch_angle_control_rad_s = pitch_angle_control;
+    out.yaw_command_rate_rad_s = yaw_command_rate;
+    out.pitch_command_rate_rad_s = pitch_command_rate;
     out.yaw_overload_g = limit_overload(yaw_overload_g, cfg.max_overload_g);
     out.pitch_overload_g = limit_overload(pitch_overload_g, cfg.max_overload_g);
 end
@@ -464,6 +637,12 @@ function out = lost_result()
     out.raw_pitch_los_angle_rad = 0.0;
     out.raw_yaw_los_rate_rad_s = 0.0;
     out.raw_pitch_los_rate_rad_s = 0.0;
+    out.yaw_rate_control_rad_s = 0.0;
+    out.pitch_rate_control_rad_s = 0.0;
+    out.yaw_angle_control_rad_s = 0.0;
+    out.pitch_angle_control_rad_s = 0.0;
+    out.yaw_command_rate_rad_s = 0.0;
+    out.pitch_command_rate_rad_s = 0.0;
     out.yaw_overload_g = 0.0;
     out.pitch_overload_g = 0.0;
 end
@@ -651,88 +830,122 @@ function path = make_output_path(file_name)
     path = fullfile(output_dir, file_name);
 end
 
-function plot_simulation_result(t, true_x, true_y, meas_x_plot, meas_y_plot, scene_log, sim, cfg, scene)
+function plot_simulation_result(t, true_x, true_y, meas_x_plot, meas_y_plot, scene_log, sim, cfg, scene, hit_result)
     output_path = make_output_path('guidance_simulation_result.png');
     output_dir = fileparts(output_path);
     if ~exist(output_dir, 'dir')
         mkdir(output_dir);
     end
 
-    fig = figure('Name', 'Guidance Algorithm Simulation', 'Color', 'w');
+    display_mask = t <= hit_result.impact_time_s;
+    plot_t = t(display_mask);
+
+    pixel_observation_mask = display_mask & scene_log.camera_enabled & ...
+        true_x >= 0.0 & true_x <= cfg.image_width & ...
+        true_y >= 0.0 & true_y <= cfg.image_height;
+    true_x_plot = true_x;
+    true_y_plot = true_y;
+    true_x_plot(~pixel_observation_mask) = NaN;
+    true_y_plot(~pixel_observation_mask) = NaN;
+    meas_x_plot(~display_mask | ~scene_log.camera_enabled) = NaN;
+    meas_y_plot(~display_mask | ~scene_log.camera_enabled) = NaN;
+
+    fig = figure('Name', '导引算法仿真', 'Color', 'w');
     set(fig, 'Position', [80, 80, 1150, 860]);
 
     subplot(3, 2, 1);
-    plot(true_x, true_y, 'LineWidth', 1.6);
+    plot(true_x_plot, true_y_plot, 'LineWidth', 1.6);
     hold on;
     plot(meas_x_plot, meas_y_plot, '.', 'MarkerSize', 5);
     plot(cfg.cx, cfg.cy, 'kx', 'LineWidth', 1.8, 'MarkerSize', 10);
     set(gca, 'YDir', 'reverse');
     grid on;
     axis([0, cfg.image_width, 0, cfg.image_height]);
-    xlabel('pixel x');
-    ylabel('pixel y');
-    title('Target pixel trajectory');
-    legend('true', 'measured', 'center', 'Location', 'best');
+    xlabel('像素 x');
+    ylabel('像素 y');
+    title('相机观测后的目标像素轨迹');
+    legend('真实值', '测量值', '图像中心', 'Location', 'best');
 
     subplot(3, 2, 2);
-    plot(t, scene_log.target_lateral_m * 1000.0, 'LineWidth', 1.5);
+    plot(plot_t, scene_log.target_lateral_m(display_mask) * 1000.0, 'LineWidth', 1.5);
     hold on;
-    plot(t, scene_log.range_m, ':', 'LineWidth', 1.3);
-    xline_local(scene.target_move_time_s, 'k:');
-    xline_local(scene.apex_time_s, 'r:');
+    plot(plot_t, scene_log.range_m(display_mask), ':', 'LineWidth', 1.3);
+    if scene.target_move_time_s <= hit_result.impact_time_s
+        xline_local(scene.target_move_time_s, 'k:');
+    end
+    if scene.apex_time_s <= hit_result.impact_time_s
+        xline_local(scene.apex_time_s, 'r:');
+    end
     grid on;
-    xlabel('time (s)');
-    ylabel('mm / m');
-    title(sprintf('Pitch %.1f deg, yaw %.1f deg, forward %.1f m', ...
-        scene.launch_pitch_deg, scene.launch_yaw_deg, scene.target_forward_distance_m));
-    legend('target lateral (mm)', 'range (m)', '0.6 s', 'apex', 'Location', 'best');
+    xlabel('时间 (秒)');
+    ylabel('目标横向 (mm) / 弹目距离 (m)');
+    title(sprintf('目标右前方 %.1f 度，发射偏航正对目标，前向距离 %.1f m', ...
+        scene.target_bearing_right_deg, scene.target_forward_distance_m));
+    legend('目标横向位置 (mm)', '弹目距离 (m)', '0.6 秒', '弹道最高点', 'Location', 'best');
 
     subplot(3, 2, 3);
-    plot(t, rad2deg_local(sim.raw_yaw_angle), ':', 'LineWidth', 1.0);
+    plot(plot_t, rad2deg_local(sim.raw_yaw_angle(display_mask)), ':', 'LineWidth', 1.0);
     hold on;
-    plot(t, rad2deg_local(sim.yaw_angle), 'LineWidth', 1.4);
-    plot(t, rad2deg_local(sim.raw_pitch_angle), ':', 'LineWidth', 1.0);
-    plot(t, rad2deg_local(sim.pitch_angle), 'LineWidth', 1.4);
+    plot(plot_t, rad2deg_local(sim.yaw_angle(display_mask)), 'LineWidth', 1.4);
+    plot(plot_t, rad2deg_local(sim.raw_pitch_angle(display_mask)), ':', 'LineWidth', 1.0);
+    plot(plot_t, rad2deg_local(sim.pitch_angle(display_mask)), 'LineWidth', 1.4);
     grid on;
-    xlabel('time (s)');
-    ylabel('angle (deg)');
-    title('LOS angles');
-    legend('yaw raw', 'yaw filtered', 'pitch raw', 'pitch filtered', 'Location', 'best');
+    xlabel('时间 (秒)');
+    ylabel('角度 (度)');
+    title('弹目视线角');
+    legend('偏航原始值', '偏航滤波值', '俯仰原始值', '俯仰滤波值', 'Location', 'best');
 
     subplot(3, 2, 4);
-    plot(t, rad2deg_local(sim.raw_yaw_rate), ':', 'LineWidth', 1.0);
+    plot(plot_t, rad2deg_local(sim.raw_yaw_rate(display_mask)), ':', 'LineWidth', 1.0);
     hold on;
-    plot(t, rad2deg_local(sim.yaw_rate), 'LineWidth', 1.4);
-    plot(t, rad2deg_local(sim.raw_pitch_rate), ':', 'LineWidth', 1.0);
-    plot(t, rad2deg_local(sim.pitch_rate), 'LineWidth', 1.4);
+    plot(plot_t, rad2deg_local(sim.yaw_rate(display_mask)), 'LineWidth', 1.4);
+    plot(plot_t, rad2deg_local(sim.raw_pitch_rate(display_mask)), ':', 'LineWidth', 1.0);
+    plot(plot_t, rad2deg_local(sim.pitch_rate(display_mask)), 'LineWidth', 1.4);
     grid on;
-    xlabel('time (s)');
-    ylabel('rate (deg/s)');
-    title('LOS angle rates');
-    legend('yaw raw', 'yaw filtered', 'pitch raw', 'pitch filtered', 'Location', 'best');
+    xlabel('时间 (秒)');
+    ylabel('角速度 (度/s)');
+    title('弹目视线角速度');
+    legend('偏航原始值', '偏航滤波值', '俯仰原始值', '俯仰滤波值', 'Location', 'best');
 
     subplot(3, 2, 5);
-    plot(t, sim.yaw_overload_g, 'LineWidth', 1.5);
+    yaw_angle_overload_g = cfg.navigation_ratio * cfg.closing_velocity * ...
+        sim.yaw_angle_control_rad_s / cfg.G;
+    pitch_angle_overload_g = cfg.navigation_ratio * cfg.closing_velocity * ...
+        sim.pitch_angle_control_rad_s / cfg.G;
+    plot(plot_t, sim.actual_yaw_overload_g(display_mask), 'LineWidth', 1.6);
     hold on;
-    plot(t, sim.pitch_overload_g, 'LineWidth', 1.5);
+    plot(plot_t, sim.actual_pitch_overload_g(display_mask), 'LineWidth', 1.6);
+    stairs(plot_t, sim.yaw_overload_g(display_mask), ':', 'LineWidth', 1.2);
+    stairs(plot_t, sim.pitch_overload_g(display_mask), ':', 'LineWidth', 1.2);
+    stairs(plot_t, yaw_angle_overload_g(display_mask), '--', 'LineWidth', 1.1);
+    stairs(plot_t, pitch_angle_overload_g(display_mask), '--', 'LineWidth', 1.1);
     yline_local(cfg.max_overload_g, 'k:');
     yline_local(-cfg.max_overload_g, 'k:');
     grid on;
-    xlabel('time (s)');
-    ylabel('overload (g)');
-    title('Proportional guidance command');
-    legend('yaw', 'pitch', 'upper limit', 'lower limit', 'Location', 'best');
+    xlabel('时间 (秒)');
+    ylabel('过载 (g)');
+    title('导引指令与弹目角控制项');
+    legend( ...
+        '偏航实际过载', ...
+        '俯仰实际过载', ...
+        '偏航指令过载', ...
+        '俯仰指令过载', ...
+        '偏航弹目角项', ...
+        '俯仰弹目角项', ...
+        '上限', ...
+        '下限', ...
+        'Location', 'best');
 
     subplot(3, 2, 6);
-    plot(t, sim.detected, 'LineWidth', 1.4);
+    plot(plot_t, sim.detected(display_mask), 'LineWidth', 1.4);
     hold on;
-    plot(t, scene_log.camera_enabled, ':', 'LineWidth', 1.4);
+    plot(plot_t, scene_log.camera_enabled(display_mask), ':', 'LineWidth', 1.4);
     ylim([-0.1, 1.1]);
     grid on;
-    xlabel('time (s)');
-    ylabel('state');
-    title('Camera/guidance availability');
-    legend('detected and commanded', 'camera gate', 'Location', 'best');
+    xlabel('时间 (秒)');
+    ylabel('状态');
+    title('相机与导引可用性');
+    legend('已识别并输出指令', '相机门控', 'Location', 'best');
 
     saveas(fig, output_path);
 end
@@ -748,32 +961,71 @@ function plot_flight_hit_result(t, scene_log, scene, hit_result)
     range_axis_w = [cos(yaw); sin(yaw); 0.0];
     lateral_axis_w = [-sin(yaw); cos(yaw); 0.0];
 
-    target_center = repmat(hit_result.target_world_m, 1, numel(t));
-    projectile_rel = scene_log.projectile_world_m - target_center;
+    plot_mask = t <= hit_result.impact_time_s;
+    if ~any(plot_mask)
+        plot_mask = true(size(t));
+    end
+    target_center = repmat(hit_result.target_world_m, 1, nnz(plot_mask));
+    projectile_rel = scene_log.projectile_world_m(:, plot_mask) - target_center;
     projectile_range_m = range_axis_w.' * projectile_rel;
     projectile_lateral_m = lateral_axis_w.' * projectile_rel;
     projectile_up_m = -projectile_rel(3, :);
 
     impact_range_m = dot(hit_result.projectile_world_m - hit_result.target_world_m, range_axis_w);
     impact_lateral_m = dot(hit_result.projectile_world_m - hit_result.target_world_m, lateral_axis_w);
+    initial_target_rel_m = hit_result.initial_target_world_m - hit_result.target_world_m;
+    initial_target_range_m = dot(initial_target_rel_m, range_axis_w);
+    initial_target_right_m = dot(initial_target_rel_m, lateral_axis_w);
     hit_half_mm = hit_result.half_side_m * 1000.0;
 
-    fig = figure('Name', 'Flight Trajectory and Hit Result', 'Color', 'w');
+    fig = figure('Name', '飞行轨迹与命中判定', 'Color', 'w');
     set(fig, 'Position', [120, 80, 1180, 820]);
 
     subplot(2, 2, 1);
-    plot(scene_log.projectile_world_m(1, :), scene_log.projectile_world_m(2, :), 'LineWidth', 1.6);
+    plot3( ...
+        scene_log.projectile_world_m(1, plot_mask), ...
+        scene_log.projectile_world_m(2, plot_mask), ...
+        -scene_log.projectile_world_m(3, plot_mask), ...
+        'LineWidth', 1.7);
     hold on;
-    plot(scene_log.target_world_m(1, :), scene_log.target_world_m(2, :), '--', 'LineWidth', 1.4);
-    plot(hit_result.projectile_world_m(1), hit_result.projectile_world_m(2), 'ro', 'LineWidth', 1.8, 'MarkerSize', 8);
-    plot(hit_result.target_world_m(1), hit_result.target_world_m(2), 'kx', 'LineWidth', 1.8, 'MarkerSize', 9);
-    draw_hit_box_world(hit_result.target_world_m, range_axis_w, lateral_axis_w, hit_result.half_side_m);
+    plot3( ...
+        scene_log.target_world_m(1, plot_mask), ...
+        scene_log.target_world_m(2, plot_mask), ...
+        -scene_log.target_world_m(3, plot_mask), ...
+        '--', 'LineWidth', 1.4);
+    plot3( ...
+        hit_result.projectile_world_m(1), ...
+        hit_result.projectile_world_m(2), ...
+        -hit_result.projectile_world_m(3), ...
+        'ro', 'LineWidth', 1.8, 'MarkerSize', 8);
+    plot3( ...
+        hit_result.target_world_m(1), ...
+        hit_result.target_world_m(2), ...
+        -hit_result.target_world_m(3), ...
+        'kx', 'LineWidth', 1.8, 'MarkerSize', 9);
+    plot3( ...
+        hit_result.initial_target_world_m(1), ...
+        hit_result.initial_target_world_m(2), ...
+        -hit_result.initial_target_world_m(3), ...
+        'bd', 'LineWidth', 1.6, 'MarkerSize', 7);
+    draw_hit_box_world_3d(hit_result.target_world_m, range_axis_w, lateral_axis_w, hit_result.half_side_m, 'k-');
+    draw_hit_box_world_3d(hit_result.initial_target_world_m, range_axis_w, lateral_axis_w, hit_result.half_side_m, 'k--');
     axis equal;
     grid on;
-    xlabel('forward x (m)');
-    ylabel('right y (m)');
-    title('Top view trajectory');
-    legend('projectile', 'target', 'impact', 'target center', '140 mm box', 'Location', 'best');
+    xlabel('世界 x / 场地前向 (m)');
+    ylabel('世界 y / 场地右向 (m，右为正)');
+    zlabel('上向 z (m)');
+    title('三维飞行轨迹（世界坐标系）');
+    view(38, 24);
+    legend( ...
+        '弹体', ...
+        '目标', ...
+        '落点', ...
+        '最终靶心', ...
+        '移动前靶心', ...
+        '最终 140 mm 命中框', ...
+        '移动前 140 mm 命中框', ...
+        'Location', 'best');
 
     subplot(2, 2, 2);
     plot(projectile_range_m, projectile_up_m, 'LineWidth', 1.6);
@@ -781,27 +1033,43 @@ function plot_flight_hit_result(t, scene_log, scene, hit_result)
     plot(0.0, 0.0, 'kx', 'LineWidth', 1.8, 'MarkerSize', 9);
     plot(impact_range_m, -hit_result.height_error_m, 'ro', 'LineWidth', 1.8, 'MarkerSize', 8);
     grid on;
-    xlabel('range from target center (m)');
-    ylabel('height above target plane (m)');
-    title('Side view trajectory');
-    legend('projectile', 'target center', 'impact', 'Location', 'best');
+    xlabel('相对靶心前后距离 (m)');
+    ylabel('高于目标平面高度 (m)');
+    title('侧视弹道');
+    legend('弹体', '靶心', '落点', 'Location', 'best');
 
     subplot(2, 2, 3);
     box_x = hit_half_mm * [-1, 1, 1, -1, -1];
     box_y = hit_half_mm * [-1, -1, 1, 1, -1];
+    initial_box_x = initial_target_right_m * 1000.0 + box_x;
+    initial_box_y = initial_target_range_m * 1000.0 + box_y;
     plot(box_x, box_y, 'k-', 'LineWidth', 1.7);
     hold on;
+    plot(initial_box_x, initial_box_y, 'k--', 'LineWidth', 1.4);
     plot(0.0, 0.0, 'kx', 'LineWidth', 1.9, 'MarkerSize', 10);
-    plot(impact_range_m * 1000.0, impact_lateral_m * 1000.0, 'ro', ...
+    plot(initial_target_right_m * 1000.0, initial_target_range_m * 1000.0, ...
+        'bd', 'LineWidth', 1.6, 'MarkerSize', 7);
+    plot(impact_lateral_m * 1000.0, impact_range_m * 1000.0, 'ro', ...
         'LineWidth', 1.9, 'MarkerSize', 8);
     grid on;
     axis equal;
-    margin_mm = max(160.0, max(abs([impact_range_m, impact_lateral_m])) * 1000.0 + 80.0);
+    margin_mm = max(160.0, ...
+        max(abs([ ...
+            impact_range_m, ...
+            impact_lateral_m, ...
+            initial_target_range_m, ...
+            initial_target_right_m])) * 1000.0 + 80.0);
     axis([-margin_mm, margin_mm, -margin_mm, margin_mm]);
-    xlabel('range error (mm)');
-    ylabel('lateral error (mm)');
-    title(sprintf('Hit box judgement: %s', hit_result.judgement));
-    legend('140 mm box', 'target center', 'impact', 'Location', 'best');
+    xlabel('左右脱靶 (mm，右为正)');
+    ylabel('前后脱靶 (mm，前为正)');
+    title(sprintf('命中框判定：%s', hit_result.judgement));
+    legend( ...
+        '最终 140 mm 命中框', ...
+        '移动前 140 mm 命中框', ...
+        '最终靶心', ...
+        '移动前靶心', ...
+        '落点', ...
+        'Location', 'best');
 
     subplot(2, 2, 4);
     values_mm = [
@@ -811,17 +1079,17 @@ function plot_flight_hit_result(t, scene_log, scene, hit_result)
         hit_result.outside_box_miss_m
     ] * 1000.0;
     bar(values_mm);
-    set(gca, 'XTickLabel', {'range', 'lateral', 'center miss', 'outside box'});
+    set(gca, 'XTickLabel', {'前后', '左右(右+)', '中心脱靶', '框外脱靶'});
     xtickangle_local(20);
     grid on;
     ylabel('mm');
-    title(sprintf('%s, center miss %.1f mm', ...
+    title(sprintf('%s，中心脱靶 %.1f mm', ...
         hit_result.judgement, hit_result.center_miss_m * 1000.0));
 
     saveas(fig, output_path);
 end
 
-function draw_hit_box_world(center_w, range_axis_w, lateral_axis_w, half_side_m)
+function draw_hit_box_world_3d(center_w, range_axis_w, lateral_axis_w, half_side_m, line_style)
     corners = [
         -half_side_m, -half_side_m;
         half_side_m, -half_side_m;
@@ -831,7 +1099,7 @@ function draw_hit_box_world(center_w, range_axis_w, lateral_axis_w, half_side_m)
     ];
     points = repmat(center_w, 1, size(corners, 1)) + ...
         range_axis_w * corners(:, 1).' + lateral_axis_w * corners(:, 2).';
-    plot(points(1, :), points(2, :), 'k-', 'LineWidth', 1.6);
+    plot3(points(1, :), points(2, :), -points(3, :), line_style, 'LineWidth', 1.6);
 end
 
 function save_simulation_data(t, true_x, true_y, meas_x, meas_y, roll_deg, gyro_b, scene_log, sim, cfg, scene, hit_result)
@@ -842,7 +1110,7 @@ function save_simulation_data(t, true_x, true_y, meas_x, meas_y, roll_deg, gyro_
     end
     save(output_path, 't', 'true_x', 'true_y', 'meas_x', 'meas_y', ...
         'roll_deg', 'gyro_b', 'scene_log', 'sim', 'cfg', 'scene', 'hit_result');
-    fprintf('Output data: %s\n', output_path);
+    fprintf('输出数据：%s\n', output_path);
 end
 
 function xtickangle_local(angle_deg)
