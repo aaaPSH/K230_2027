@@ -34,6 +34,8 @@ class ProportionalGuidance:
         navigation_ratio=3.0,
         closing_velocity=15.0,
         position_to_rate_gain=0.0,
+        yaw_angle_control_gain=0.0,
+        pitch_angle_control_gain=0.0,
         rate_filter_alpha=None,
         use_kalman_filter=True,
         kalman_angle_variance=0.05,
@@ -61,6 +63,8 @@ class ProportionalGuidance:
         self.navigation_ratio = navigation_ratio
         self.closing_velocity = closing_velocity
         self.position_to_rate_gain = position_to_rate_gain
+        self.yaw_angle_control_gain = yaw_angle_control_gain
+        self.pitch_angle_control_gain = pitch_angle_control_gain
         if rate_filter_alpha is None:
             self.rate_filter_alpha = None
         else:
@@ -144,8 +148,14 @@ class ProportionalGuidance:
             dt,
         )
 
-        yaw_command_rate = yaw_dot + self.position_to_rate_gain * yaw_angle
-        pitch_command_rate = pitch_dot + self.position_to_rate_gain * pitch_angle
+        yaw_angle_gain = self.position_to_rate_gain + self.yaw_angle_control_gain
+        pitch_angle_gain = self.position_to_rate_gain + self.pitch_angle_control_gain
+        yaw_rate_control = yaw_dot
+        pitch_rate_control = pitch_dot
+        yaw_angle_control = yaw_angle_gain * yaw_angle
+        pitch_angle_control = pitch_angle_gain * pitch_angle
+        yaw_command_rate = yaw_rate_control + yaw_angle_control
+        pitch_command_rate = pitch_rate_control + pitch_angle_control
         yaw_overload_g = (
             self.navigation_ratio * self.closing_velocity * yaw_command_rate / G
         )
@@ -168,6 +178,12 @@ class ProportionalGuidance:
             "raw_pitch_los_angle_rad": raw_pitch_angle,
             "raw_yaw_los_rate_rad_s": raw_yaw_dot,
             "raw_pitch_los_rate_rad_s": raw_pitch_dot,
+            "yaw_rate_control_rad_s": yaw_rate_control,
+            "pitch_rate_control_rad_s": pitch_rate_control,
+            "yaw_angle_control_rad_s": yaw_angle_control,
+            "pitch_angle_control_rad_s": pitch_angle_control,
+            "yaw_command_rate_rad_s": yaw_command_rate,
+            "pitch_command_rate_rad_s": pitch_command_rate,
             "yaw_overload_g": self._limit_overload(yaw_overload_g),
             "pitch_overload_g": self._limit_overload(pitch_overload_g),
         }
@@ -318,6 +334,12 @@ class ProportionalGuidance:
             "pitch_los_angle_rad": 0.0,
             "yaw_los_rate_rad_s": 0.0,
             "pitch_los_rate_rad_s": 0.0,
+            "yaw_rate_control_rad_s": 0.0,
+            "pitch_rate_control_rad_s": 0.0,
+            "yaw_angle_control_rad_s": 0.0,
+            "pitch_angle_control_rad_s": 0.0,
+            "yaw_command_rate_rad_s": 0.0,
+            "pitch_command_rate_rad_s": 0.0,
             "yaw_overload_g": 0.0,
             "pitch_overload_g": 0.0,
         }

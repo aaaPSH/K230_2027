@@ -1,6 +1,6 @@
 """进行基地目标靶绿灯的识别和检测"""
-import math
 import cv2
+from ulab import numpy as np
 
 class Detector:
 
@@ -33,7 +33,7 @@ class Detector:
         if perimeter == 0:
             return False
 
-        circularity = 4 * math.pi * area / (perimeter * perimeter)
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
         if circularity < self.min_circularity:
             return False
 
@@ -49,16 +49,14 @@ class Detector:
 
     def detect(self, image):
         """检测图像中的基地目标靶绿灯"""
-        if cv2 is None:
-            return self._detect_without_cv2(image)
 
         # 将图像转换为HSV颜色空间
-        hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        hsv_image = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
         # 创建掩膜，提取绿色区域
         mask = cv2.inRange(
             hsv_image,
-            cv2.cvtColor(self.thresholds_low, cv2.COLOR_BGR2HSV)[0],
-            cv2.cvtColor(self.thresholds_high, cv2.COLOR_BGR2HSV)[0],
+            cv2.cvtColor(self.thresholds_low, cv2.COLOR_RGB2HSV)[0],
+            cv2.cvtColor(self.thresholds_high, cv2.COLOR_RGB2HSV)[0],
         )
         mask = cv2.medianBlur(mask, 5)
         # 查找轮廓
