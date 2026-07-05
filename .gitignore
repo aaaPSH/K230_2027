@@ -1,2 +1,23 @@
-/.agent
+# IDE / Editor
+/.agents
 /.codex
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# MATLAB generated outputs
+matlab/output/
+
+# DART vision output
+src/dart_py/output/
