@@ -47,9 +47,10 @@ class UartImuInterface(GyroInterface):
 
     默认 CSV 报文紧凑，足以支持高速链路::
 
-        gx,gy,gz,ax,ay,az,gpio_bits\\n
+        ay,ax,az,pitch,roll,yaw\\n
 
-    陀螺仪数据单位为 rad/s；加速度数据可使用任意一致的单位。
+    串口顺序保持发送方的 ``ay,ax,az,pitch,roll,yaw``；字段映射会将其
+    重排为制导使用的 ``accel_b=[ax,ay,az]``、``gyro_b=[roll,pitch,yaw]``。
     当 ``packet_format`` 设为 ``"json"`` 时也接受 JSON 行，例如::
 
         {"gyro_b":[gx,gy,gz],"accel_b":[ax,ay,az],"gpio":{"armed":1}}\\n
@@ -68,8 +69,11 @@ class UartImuInterface(GyroInterface):
         self.timestamp_source = self.config.get("timestamp_source", "arrival")
         self.csv_fields = self.config.get(
             "csv_fields",
-            ["gx", "gy", "gz", "ax", "ay", "az", "gpio_bits"],
+            ["ay", "ax", "az", "pitch", "roll", "yaw"],
         )
+        self.accel_fields = self.config.get("accel_fields", ["ax", "ay", "az"])
+        self.gyro_fields = self.config.get("gyro_fields", ["roll", "pitch", "yaw"])
+        self.gyro_unit = self.config.get("gyro_unit", "rad_s")
         self.max_line_bytes = max(32, int(self.config.get("max_line_bytes", 256)))
         self.max_pending_packets = max(
             1,
@@ -139,10 +143,11 @@ class UartImuInterface(GyroInterface):
         if not isinstance(record, dict):
             raise ValueError("UART IMU packet must decode to a dictionary")
 
-        gyro_b = _packet_vector(record, "gyro_b", ("gx", "gy", "gz"))
-        accel_b = _packet_vector(record, "accel_b", ("ax", "ay", "az"))
+        gyro_b = _packet_vector(record, "gyro_b", self.gyro_fields)
+        accel_b = _packet_vector(record, "accel_b", self.accel_fields)
         if gyro_b is None or accel_b is None:
             raise ValueError("UART IMU packet has no complete IMU vector")
+        gyro_b = _gyro_to_rad_s(gyro_b, self.gyro_unit)
 
         packet_timestamp_us = _packet_integer(record.get("timestamp_us"))
         timestamp_us = arrival_timestamp_us
@@ -408,3 +413,11 @@ def _packet_integer(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _gyro_to_rad_s(gyro_b, unit):
+    if unit == "rad_s":
+        return gyro_b
+    if unit == "deg_s":
+        return [value * 0.017453292519943295 for value in gyro_b]
+    raise ValueError("unsupported gyro_unit: {}".format(unit))

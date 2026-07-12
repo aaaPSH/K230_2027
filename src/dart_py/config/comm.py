@@ -22,10 +22,15 @@ COMM_CONFIG = {
         "stop": 1,
         "timeout": 0,
         # 每次发送一个以换行符结尾的报文：
-        # gx,gy,gz,ax,ay,az,gpio_bits\n
-        # 陀螺仪：rad/s；加速度：任意一致单位（通常为 m/s^2）。
+        # ay,ax,az,pitch,roll,yaw
+        # 加速度按协议 ay,ax,az 发送，映射后为机体系 [ax,ay,az]。
+        # 后三项按 pitch,roll,yaw 发送，映射后为 [roll,pitch,yaw]。
         "packet_format": "csv",
-        "csv_fields": ["gx", "gy", "gz", "ax", "ay", "az", "gpio_bits"],
+        "csv_fields": ["ay", "ax", "az", "pitch", "roll", "yaw"],
+        "accel_fields": ["ax", "ay", "az"],
+        "gyro_fields": ["roll", "pitch", "yaw"],
+        # 若发送端已经输出 rad/s，则改为 "rad_s"。
+        "gyro_unit": "rad_s",
         # "arrival" 使用 K230 UART 接收时间，因此与图像时间戳共享
         # 同一时钟。仅当发送方已同步时使用 "packet"。
         "timestamp_source": "arrival",
