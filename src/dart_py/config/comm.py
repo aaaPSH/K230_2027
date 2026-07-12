@@ -1,8 +1,8 @@
-"""Communication, IMU, and GPIO parameters.
+"""通信、IMU 和 GPIO 参数。
 
-The default IMU transport is a newline-framed UART stream.  Use an
-``ImuInterface`` subclass in ``comm.make_imu_interface`` only for a different
-physical transport or packet protocol.
+默认 IMU 传输使用换行符分帧的 UART 流。
+仅在需要不同的物理传输或报文协议时，在 ``comm.make_imu_interface``
+中使用 ``ImuInterface`` 的子类。
 """
 
 COMM_CONFIG = {
@@ -11,46 +11,49 @@ COMM_CONFIG = {
     "imu": {
         "enabled": True,
         "transport": "uart",
-        # UART1/2/4 are available to applications on CanMV K230.  Configure
-        # the selected UART's RX/TX pins through the board's IOMUX setup.
+        # CanMV K230 上可供应用使用的 UART 为 UART1/2/4。
+        # 下面为 UART1 常用的 TX=9、RX=10；请按实际开发板接线修改。
         "uart_id": "UART1",
-        "baudrate": 921600,
+        "tx_pin": 9,
+        "rx_pin": 10,
+        "baudrate": 115200,
         "bits": 8,
         "parity": "none",
         "stop": 1,
-        # One newline-terminated packet at a time:
+        "timeout": 0,
+        # 每次发送一个以换行符结尾的报文：
         # gx,gy,gz,ax,ay,az,gpio_bits\n
-        # gyro: rad/s; accel: any consistent unit (normally m/s^2).
+        # 陀螺仪：rad/s；加速度：任意一致单位（通常为 m/s^2）。
         "packet_format": "csv",
         "csv_fields": ["gx", "gy", "gz", "ax", "ay", "az", "gpio_bits"],
-        # "arrival" is the K230 UART receive time and therefore shares the
-        # image timestamp clock.  Use "packet" only for a synchronized sender.
+        # "arrival" 使用 K230 UART 接收时间，因此与图像时间戳共享
+        # 同一时钟。仅当发送方已同步时使用 "packet"。
         "timestamp_source": "arrival",
         "max_line_bytes": 128,
         "max_pending_packets": 32,
     },
     "attitude": {
-        # 1 kHz is independent of the camera/inference frame rate.
+        # 1 kHz 采样率，与相机/推理帧率无关。
         "sample_period_us": 1000,
         "max_dt_us": 5000,
-        # Covers 512 ms at the 1 kHz default, including detector latency.
+        # 在 1 kHz 默认值下覆盖 512 ms，包含检测器延迟。
         "history_size": 512,
-        # Average still samples after boot for gravity-based initial roll and
-        # a gyro bias estimate.  Integration starts once this is complete.
+        # 启动后采集静止样本，用于基于重力的初始滚转角和陀螺仪零偏估计。
+        # 采集完成后开始积分。
         "initial_roll_samples": 32,
         "stationary_gyro_rad_s": 0.15,
         "estimate_gyro_bias": True,
-        # Typical accelerometers report specific force, i.e. -gravity at rest.
-        # Set to +1.0 if the IMU driver already returns a gravity vector.
+        # 典型加速度计输出比力，即静止时为 -重力。
+        # 如果 IMU 驱动已返回重力矢量，则设为 +1.0。
         "accel_gravity_sign": -1.0,
         "roll_axis": 0,
-        # state_at() chooses the sample nearest to the image timestamp.  Reject
-        # it when the absolute timestamp difference exceeds this value.
+        # state_at() 选择距图像时间戳最近的样本。
+        # 当绝对时间戳差超过此值时拒绝匹配。
         "max_match_error_us": 100000,
     },
     "gpio": {
-        # Set enabled and declare pins once board wiring is known, e.g.
-        # {"name": "launch_enable", "pin": 12, "pull": "down"}.
+        # 确定开发板接线后，启用并声明引脚，例如：
+        # {"name": "launch_enable", "pin": 12, "pull": "down"}。
         "enabled": False,
         "pins": [],
     },

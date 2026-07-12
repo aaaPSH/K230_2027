@@ -1,13 +1,13 @@
-"""K230 CanMV entrypoint for dart guidance."""
+"""K230 CanMV 入口 - dart 引导程序。"""
 import gc
 import os
 import time
 import sys
 
-# PROJECT_PATH = "/sdcard/dart_py"
+PROJECT_DIR = "/sdcard/dart_py"
 
-# if PROJECT_PATH not in sys.path:
-#     sys.path.append(PROJECT_PATH)
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
 
 from media.sensor import *
 from media.display import *
@@ -118,8 +118,8 @@ def step_guidance(
         guidance.predict_kalman(dt)
         guidance_result = guidance.lost_result()
 
-    # Keep alignment diagnostics with the guidance output.  They are useful
-    # when tuning UART baud rate, sensor rate, and the matching window.
+    # 将时间对齐诊断信息附加到引导输出中。
+    # 在调优 UART 波特率、传感器速率和匹配窗口时很有用。
     if attitude_state is not None:
         guidance_result["sensor_timestamp_us"] = attitude_state.get("timestamp_us")
         guidance_result["sensor_timestamp_delta_us"] = attitude_state.get(
@@ -188,9 +188,9 @@ def run():
                 dt = 0.0
 
             image = sensor.snapshot(chn=channel_id)
-            # This timestamp is recorded as soon as the frame is returned.
-            # If the camera driver later exposes an exposure timestamp, pass
-            # that value here instead (using the same ticks_us() clock base).
+            # 此时间戳在图像帧返回时立即记录。
+            # 如果相机驱动后续暴露了曝光时间戳，则改用该值
+            # （使用相同的 ticks_us() 时钟基准）。
             image_timestamp_us = ticks_us()
             detection, guidance_result, command = step_guidance(
                 detector,

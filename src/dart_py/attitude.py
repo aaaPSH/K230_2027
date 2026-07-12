@@ -1,9 +1,8 @@
-"""High-rate IMU/GPIO sampling and timestamped roll-state lookup.
+"""高频 IMU/GPIO 采样与带时间戳的滚转姿态查询。
 
-The camera/guidance loop must not read an IMU directly: inference and display
-can delay that loop by many milliseconds.  ``AttitudeWorker`` owns the IMU and
-GPIO reads, integrates roll in its own thread, and keeps a short timestamped
-history for the camera loop to query.
+相机/引导回路不应直接读取 IMU：推理和显示可能使该回路延迟数毫秒。
+``AttitudeWorker`` 独占 IMU 和 GPIO 读取，在自己的线程中积分滚转角，
+并维护一份带时间戳的短历史记录供相机回路查询。
 """
 import math
 import time
@@ -20,14 +19,14 @@ except ImportError:
 
 
 def ticks_us():
-    """Return a monotonic timestamp in microseconds on CanMV and CPython."""
+    """返回 CanMV 和 CPython 上的单调微秒时间戳。"""
     if hasattr(time, "ticks_us"):
         return time.ticks_us()
     return int(time.time() * 1000000)
 
 
 def ticks_diff(newer, older):
-    """Return ``newer - older`` while handling MicroPython tick wraparound."""
+    """返回 ``newer - older``，同时处理 MicroPython 滴答溢出的情况。"""
     if hasattr(time, "ticks_diff"):
         return time.ticks_diff(newer, older)
     return newer - older
@@ -84,17 +83,16 @@ def _wrap_pi(angle_rad):
 
 
 class AttitudeWorker:
-    """Sample IMU/GPIO at a fixed rate and provide image-time attitude.
+    """以固定速率采样 IMU/GPIO，并提供图像时刻的姿态信息。
 
-    IMU ``read()`` data uses the body coordinate convention already used by
-    ``guidance.py``: ``[x forward, y right, z down]``.  It must provide
-    ``gyro_b`` in rad/s and ``accel_b`` in m/s^2 (or any consistent unit):
+    IMU ``read()`` 数据使用与 ``guidance.py`` 相同的机体坐标系约定：
+    ``[x 前, y 右, z 下]``。必须提供 ``gyro_b``（rad/s）和
+    ``accel_b``（m/s^2 或任意一致单位）：
 
     ``{"gyro_b": [p, q, r], "accel_b": [ax, ay, az], "timestamp_us": ...}``
 
-    The timestamp is optional.  When omitted, the worker timestamps the read
-    with its monotonic clock.  All image timestamps passed to ``state_at`` must
-    use the same clock.
+    时间戳是可选的。省略时，工作线程用其单调时钟为读取打上时间戳。
+    所有传入 ``state_at`` 的图像时间戳必须使用同一时钟。
     """
 
     def __init__(self, imu_interface, gpio_interface=None, config=None):
@@ -122,7 +120,7 @@ class AttitudeWorker:
             int(
                 self.config.get(
                     "max_match_error_us",
-                    # Compatibility with the first version of this module.
+                    # 与本模块第一版的兼容。
                     self.config.get(
                         "max_lookup_age_us",
                         self.history_size * self.sample_period_us,
@@ -150,7 +148,7 @@ class AttitudeWorker:
         return self._roll_rad is not None
 
     def start(self):
-        """Start the high-rate worker.  Calling it twice is safe."""
+        """启动高频工作线程。重复调用是安全的。"""
         if self._thread_started:
             return
         self._running = True
@@ -164,21 +162,19 @@ class AttitudeWorker:
             worker.start()
             return
 
-        # CanMV provides _thread.  This fallback retains functional behavior
-        # on a minimal port, although sampling then happens only on explicit
-        # calls to sample_once().
+        # CanMV 提供 _thread。此回退在最小化移植上保留功能行为，
+        # 尽管采样只能通过显式调用 sample_once() 来进行。
         self._thread_started = False
 
     def stop(self):
-        """Ask the worker to leave its loop; interfaces are not closed here."""
+        """请求工作线程退出循环；此处不关闭接口。"""
         self._running = False
 
     def sample_once(self, timestamp_us=None):
-        """Read one IMU/GPIO sample.  Useful for single-threaded test ports."""
+        """读取一次 IMU/GPIO 样本。适用于单线程测试移植。"""
         read_timestamp_us = ticks_us() if timestamp_us is None else timestamp_us
-        # GPIO is sampled on the same high-rate schedule as the IMU.  Reading
-        # it first also keeps a physical input active even during a temporary
-        # IMU bus outage.
+        # GPIO 与 IMU 按相同的高频周期采样。先读取 GPIO 还能
+        # 在 IMU 总线暂时故障时保持物理输入处于活跃状态。
         local_gpio = self._read_gpio()
         data = self.imu_interface.read() if self.imu_interface is not None else None
         if data is None:
@@ -212,13 +208,11 @@ class AttitudeWorker:
         return sample
 
     def state_at(self, image_timestamp_us, max_age_us=None):
-        """Return the IMU/GPIO state closest to an image timestamp.
+        """返回距图像时间戳最近的 IMU/GPIO 状态。
 
-        The lookup considers samples on both sides of the image time and picks
-        the smallest absolute timestamp difference.  This is important for a
-        UART stream: the camera can run between two IMU packets.  The result is
-        copied so the guidance loop never sees a partially overwritten
-        ring-buffer item.
+        查询会考虑图像时间两侧的样本，选择绝对时间戳差最小的。
+        这对 UART 流很重要：相机可能在两个 IMU 报文之间运行。
+        结果经过拷贝，因此引导回路不会看到环形缓冲区中被部分覆盖的条目。
         """
         if image_timestamp_us is None:
             return None
@@ -248,8 +242,8 @@ class AttitudeWorker:
             return None
 
         result = _copy_sample(best_sample)
-        # Positive delta means the sensor sample is newer than the image;
-        # negative means it was sampled before the image.
+        # 正差值表示传感器样本比图像更新；
+        # 负差值表示样本在图像之前采集。
         result["timestamp_delta_us"] = best_delta_us
         result["timestamp_error_us"] = abs(best_delta_us)
         result["timestamp_match"] = (
@@ -264,8 +258,8 @@ class AttitudeWorker:
                 self.sample_once()
                 self.last_error = None
             except BaseException as exc:
-                # An intermittent I2C/SPI read error must not kill attitude
-                # updates permanently.  The main loop can inspect last_error.
+                # 间歇性的 I2C/SPI 读取错误不应永久终止姿态更新。
+                # 主循环可以检查 last_error。
                 self.last_error = str(exc)
 
             next_sample_us = ticks_add(next_sample_us, self.sample_period_us)
@@ -273,7 +267,7 @@ class AttitudeWorker:
             if remaining_us > 0:
                 sleep_us(remaining_us)
             else:
-                # Do not accumulate a large schedule error after a slow read.
+                # 慢速读取后不累积过大的调度误差。
                 next_sample_us = ticks_us()
 
     def _read_gpio(self):
@@ -304,7 +298,7 @@ class AttitudeWorker:
             gyro_b[0] * gyro_b[0] + gyro_b[1] * gyro_b[1] + gyro_b[2] * gyro_b[2]
         )
         if gyro_norm > self.stationary_gyro_rad_s:
-            # Power-on calibration is valid only while the platform is still.
+            # 上电校准仅在平台静止时有效。
             self._init_accel_sum = [0.0, 0.0, 0.0]
             self._init_gyro_sum = [0.0, 0.0, 0.0]
             self._init_count = 0
@@ -322,9 +316,8 @@ class AttitudeWorker:
         if abs(gravity_y) + abs(gravity_z) < 1e-9:
             return
 
-        # For body axes x-forward/y-right/z-down, atan2(g_y, g_z) is the
-        # conventional roll. guidance.py applies its configurable roll_sign
-        # when transforming body LOS into its stabilized frame.
+        # 对于 x-前/y-右/z-下 的机体坐标系，atan2(g_y, g_z) 即为常规滚转角。
+        # guidance.py 在将机体视线转换为稳定坐标系时，应用其可配置的 roll_sign。
         self._roll_rad = math.atan2(gravity_y, gravity_z)
         if self.estimate_gyro_bias:
             self._gyro_bias = [
@@ -357,7 +350,7 @@ def _copy_sample(sample):
 
 
 def _merge_gpio(local_gpio, sensor_gpio):
-    """Merge local GPIO pins with optional GPIO fields sent over UART."""
+    """合并本地 GPIO 引脚与通过 UART 发送的可选 GPIO 字段。"""
     if local_gpio is None and sensor_gpio is None:
         return None
     result = {}

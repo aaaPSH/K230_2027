@@ -1,95 +1,68 @@
-"""Hardware communication interfaces.
+"""硬件通信接口。
 
-The IMU protocol remains application-specific, but its data contract is shared
-by the high-rate attitude worker.  GPIO input can be configured directly when
-the CanMV ``machine.Pin`` API is available.
+IMU 协议仍是应用相关的，但其数据契约由高频姿态工作线程共享。
+当 CanMV 的 ``machine.Pin`` API 可用时，可以直接配置 GPIO 输入。
 """
 
 
 class LowerComputerInterface:
-    """Output interface for final overload commands."""
+    """最终过载指令的输出接口。"""
 
     def __init__(self, config=None):
         self.config = config or {}
 
     def send_overload(self, command):
-        """Send one command dictionary to the lower computer.
+        """向下位机发送一个指令字典。
 
-        Default implementation is a no-op and returns True so the guidance loop
-        can run on a bare K230/IDE setup before the physical link is wired.
+        默认实现为空操作，返回 True，以便在物理链路接线之前，
+        引导回路可以在裸 K230/IDE 环境中运行。
         """
         return True
 
 
 class GyroInterface:
-    """Input interface for one raw IMU sample.
+    """单帧原始 IMU 样本的输入接口。
 
-    Subclasses should return ``None`` or a dictionary containing ``gyro_b``
-    and ``accel_b``.  Both are body-frame vectors ordered as
-    ``[x forward, y right, z down]``.  Gyro units must be rad/s.  The optional
-    ``timestamp_us`` must use ``time.ticks_us()``'s time base.
+    子类应返回 ``None`` 或包含 ``gyro_b`` 和 ``accel_b`` 的字典。
+    两者均为机体坐标系向量，顺序为 ``[x 前, y 右, z 下]``。
+    陀螺仪单位必须为 rad/s。可选的 ``timestamp_us`` 必须使用
+    ``time.ticks_us()`` 的时间基准。
     """
 
     def __init__(self, config=None):
         self.config = config or {}
 
     def read(self):
-        """Return None or {'gyro_b': [p, q, r], 'accel_b': [ax, ay, az]}."""
+        """返回 None 或 {'gyro_b': [p, q, r], 'accel_b': [ax, ay, az]}。"""
         return None
 
 
-# ``ImuInterface`` is the preferred name.  Keep GyroInterface as an alias in
-# the public API so existing IMU drivers do not need an immediate rename.
+# ``ImuInterface`` 是推荐名称。在公开 API 中保留 GyroInterface 作为别名，
+# 以便现有的 IMU 驱动无需立即重命名。
 ImuInterface = GyroInterface
 
 
 class UartImuInterface(GyroInterface):
-    """Receive newline-framed IMU packets from a UART stream.
+    """从 UART 流中接收以换行符分帧的 IMU 报文。
 
-    The default CSV packet is compact enough for a high-rate link::
+    默认 CSV 报文紧凑，足以支持高速链路::
 
         gx,gy,gz,ax,ay,az,gpio_bits\\n
 
-    Gyro values are rad/s; acceleration values use any consistent unit.  JSON
-    lines are also accepted when ``packet_format`` is ``"json"``; e.g.::
+    陀螺仪数据单位为 rad/s；加速度数据可使用任意一致的单位。
+    当 ``packet_format`` 设为 ``"json"`` 时也接受 JSON 行，例如::
 
         {"gyro_b":[gx,gy,gz],"accel_b":[ax,ay,az],"gpio":{"armed":1}}\\n
 
-    By default packet timestamps are created on K230 when a complete UART line
-    arrives.  This gives the image and sensor data a shared time base.  Select
-    ``timestamp_source="packet"`` only when the sender's ``timestamp_us`` has
-    already been synchronized to K230's ``time.ticks_us()`` clock.
+    默认情况下，报文时间戳在 K230 收到完整的 UART 行时生成。
+    这使得图像和传感器数据共享同一时间基准。
+    仅当发送方的 ``timestamp_us`` 已与 K230 的 ``time.ticks_us()``
+    时钟同步时，才选择 ``timestamp_source="packet"``。
     """
 
     def __init__(self, config=None):
         GyroInterface.__init__(self, config)
-        try:
-            from machine import UART
-        except ImportError:
-            raise RuntimeError("machine.UART is required for the UART IMU link")
-
-        uart_id = self.config.get("uart_id", 1)
-        if isinstance(uart_id, str):
-            uart_id = getattr(UART, uart_id, None)
-        if uart_id is None:
-            raise ValueError("invalid UART id")
-
-        bits = self.config.get("bits", 8)
-        if bits == 8:
-            bits = getattr(UART, "EIGHTBITS", bits)
-        parity = self.config.get("parity", "none")
-        if parity == "none":
-            parity = getattr(UART, "PARITY_NONE", parity)
-        stop = self.config.get("stop", 1)
-        if stop == 1:
-            stop = getattr(UART, "STOPBITS_ONE", stop)
-        self.uart = UART(
-            uart_id,
-            baudrate=int(self.config.get("baudrate", 921600)),
-            bits=bits,
-            parity=parity,
-            stop=stop,
-        )
+        self.uart = initialize_uart(self.config)
 
         self.packet_format = self.config.get("packet_format", "csv").lower()
         self.timestamp_source = self.config.get("timestamp_source", "arrival")
@@ -136,7 +109,7 @@ class UartImuInterface(GyroInterface):
             if line:
                 self._append_packet(line)
 
-        # Do not allow a damaged/no-newline packet to consume the heap forever.
+        # 防止损坏/无换行的报文永久消耗堆内存。
         if len(self._rx_buffer) > self.max_line_bytes:
             self._rx_buffer = bytearray()
             self.invalid_packet_count += 1
@@ -152,7 +125,7 @@ class UartImuInterface(GyroInterface):
             return
         self._pending_packets.append(packet)
         if len(self._pending_packets) > self.max_pending_packets:
-            # Retain the most recent samples so image matching cannot lag.
+            # 保留最新样本，防止图像匹配滞后。
             del self._pending_packets[0]
 
     def _parse_packet(self, line):
@@ -206,18 +179,18 @@ class UartImuInterface(GyroInterface):
 
 
 class GPIOInterface:
-    """Input interface for GPIO state captured with each IMU sample."""
+    """IMU 采样时同步捕获的 GPIO 状态的输入接口。"""
 
     def __init__(self, config=None):
         self.config = config or {}
 
     def read(self):
-        """Return None or a dictionary such as {'launch_enable': True}."""
+        """返回 None 或类似 {'launch_enable': True} 的字典。"""
         return None
 
 
 class MachineGPIOInterface(GPIOInterface):
-    """Read named digital inputs through CanMV's ``machine.Pin`` API."""
+    """通过 CanMV 的 ``machine.Pin`` API 读取命名的数字量输入。"""
 
     def __init__(self, config=None):
         GPIOInterface.__init__(self, config)
@@ -250,7 +223,7 @@ class MachineGPIOInterface(GPIOInterface):
                     )
                 )
             except Exception:
-                # One bad pin declaration should not disable other inputs.
+                # 一个引脚的配置错误不应导致其他输入失效。
                 continue
 
     def read(self):
@@ -262,7 +235,7 @@ class MachineGPIOInterface(GPIOInterface):
 
 
 class ConsoleLowerComputerInterface(LowerComputerInterface):
-    """Optional debug sender that prints the command dictionary."""
+    """可选的调试发送器，将指令字典打印到控制台。"""
 
     def send_overload(self, command):
         print(
@@ -287,7 +260,7 @@ def make_gyro_interface(config):
 
 
 def make_imu_interface(config):
-    """Create the configured IMU transport."""
+    """创建配置指定的 IMU 传输实例。"""
     imu_config = config.get("imu", {})
     if imu_config.get("enabled", False):
         if imu_config.get("transport", "uart") == "uart":
@@ -301,6 +274,99 @@ def make_gpio_interface(config):
     if not gpio_config.get("enabled", False):
         return GPIOInterface(gpio_config)
     return MachineGPIOInterface(gpio_config)
+
+
+def initialize_uart(config):
+    """Configure UART IOMUX pins and create a UART from one config mapping.
+
+    ``tx_pin`` and ``rx_pin`` are optional.  When supplied, their FPIOA
+    functions are derived from ``uart_id`` (or overridden by
+    ``tx_function``/``rx_function``).  This keeps pin assignment and UART
+    parameters in the same ``COMM_CONFIG['imu']`` section.
+    """
+    try:
+        from machine import UART
+    except ImportError:
+        raise RuntimeError("machine.UART is required for the UART IMU link")
+
+    uart_id, uart_name = _resolve_uart_id(UART, config.get("uart_id", "UART1"))
+    _configure_uart_pins(config, uart_name)
+
+    bits = config.get("bits", 8)
+    if bits == 8:
+        bits = getattr(UART, "EIGHTBITS", bits)
+    parity = config.get("parity", "none")
+    if parity == "none":
+        parity = getattr(UART, "PARITY_NONE", parity)
+    stop = config.get("stop", 1)
+    if stop == 1:
+        stop = getattr(UART, "STOPBITS_ONE", stop)
+
+    uart_kwargs = {
+        "baudrate": int(config.get("baudrate", 921600)),
+        "bits": bits,
+        "parity": parity,
+        "stop": stop,
+    }
+    if "timeout" in config:
+        uart_kwargs["timeout"] = int(config["timeout"])
+    try:
+        return UART(uart_id, **uart_kwargs)
+    except TypeError:
+        # Older CanMV firmware does not expose the optional timeout argument.
+        uart_kwargs.pop("timeout", None)
+        return UART(uart_id, **uart_kwargs)
+
+
+def _resolve_uart_id(UART, uart_id):
+    if isinstance(uart_id, str):
+        resolved = getattr(UART, uart_id, None)
+        if resolved is None:
+            raise ValueError("invalid UART id: {}".format(uart_id))
+        return resolved, uart_id
+
+    for name in ("UART1", "UART2", "UART3", "UART4"):
+        if getattr(UART, name, None) == uart_id:
+            return uart_id, name
+    raise ValueError("invalid UART id")
+
+
+def _configure_uart_pins(config, uart_name):
+    tx_pin = config.get("tx_pin")
+    rx_pin = config.get("rx_pin")
+    if tx_pin is None and rx_pin is None:
+        return
+    try:
+        from machine import FPIOA
+    except ImportError:
+        raise RuntimeError("machine.FPIOA is required to configure UART pins")
+
+    fpioa = FPIOA()
+    if tx_pin is not None:
+        tx_function = config.get("tx_function", "{}_TXD".format(uart_name))
+        fpioa.set_function(
+            int(tx_pin),
+            _fpioa_function(fpioa, FPIOA, tx_function),
+            ie=0,
+            oe=1,
+        )
+    if rx_pin is not None:
+        rx_function = config.get("rx_function", "{}_RXD".format(uart_name))
+        fpioa.set_function(
+            int(rx_pin),
+            _fpioa_function(fpioa, FPIOA, rx_function),
+            ie=1,
+            oe=0,
+        )
+
+
+def _fpioa_function(fpioa, FPIOA, name):
+    function = getattr(FPIOA, name, None)
+    if function is None:
+        function = getattr(fpioa, name, None)
+    if function is None:
+        raise ValueError("unsupported FPIOA function: {}".format(name))
+    return function
 
 
 def _ticks_us():
