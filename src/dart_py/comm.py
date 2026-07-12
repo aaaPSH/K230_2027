@@ -304,10 +304,71 @@ class ConsoleLowerComputerInterface(LowerComputerInterface):
         return True
 
 
+class DebugUartLowerComputerInterface(LowerComputerInterface):
+    """通过独立 UART 发送关键制导数据的 JSON 调试报文。"""
+
+    def __init__(self, config=None):
+        LowerComputerInterface.__init__(self, config)
+        self.period_ms = max(0, int(self.config.get("debug_period_ms", 50)))
+        self._last_output_ms = None
+        self.uart = initialize_uart(self.config)
+        self.rs485 = _initialize_rs485_pins(self.config)
+
+    def send_overload(self, command):
+        if not _debug_due(self):
+            return True
+        payload = _json_dumps(_debug_payload(command)) + "\n"
+        if isinstance(payload, str):
+            payload = payload.encode()
+
+        _set_rs485_transmit(self.rs485, True)
+        try:
+            self.uart.write(payload)
+            flush = getattr(self.uart, "flush", None)
+            if callable(flush):
+                flush()
+        finally:
+            _set_rs485_transmit(self.rs485, False)
+        return True
+
+    def deinit(self):
+        if self.uart is not None and hasattr(self.uart, "deinit"):
+            self.uart.deinit()
+        self.uart = None
+        self.rs485 = None
+
+
 def make_lower_computer_interface(config):
+    debug_uart_config = config.get("debug_uart", {})
+    if debug_uart_config.get("enabled", False):
+        return DebugUartLowerComputerInterface(debug_uart_config)
     if config.get("debug_print", False):
         return ConsoleLowerComputerInterface(config)
     return LowerComputerInterface(config)
+
+
+def _debug_due(interface):
+    """按配置限频，避免调试输出阻塞图像主循环。"""
+    now_ms = _ticks_ms()
+    if (
+        interface._last_output_ms is not None
+        and interface.period_ms > 0
+        and now_ms - interface._last_output_ms < interface.period_ms
+    ):
+        return False
+    interface._last_output_ms = now_ms
+    return True
+
+
+def _debug_payload(command):
+    """提取需要通过串口发送的关键调试字段。"""
+    fields = (
+        "target_x", "target_y",
+        "yaw", "pitch", "yaw_rate", "pitch_rate",
+        "gyro_x", "gyro_y", "gyro_z",
+        "yaw_cmd_g", "pitch_cmd_g", "roll",
+    )
+    return {name: command.get(name, 0.0) for name in fields}
 
 
 def make_gyro_interface(config):
@@ -415,6 +476,55 @@ def _configure_uart_pins(config, uart_name):
         )
 
 
+def _initialize_rs485_pins(config):
+    """初始化可选的 RS-485 DE 和 /RE 控制脚。"""
+    de_pin = config.get("de_pin")
+    re_pin = config.get("re_pin")
+    if de_pin is None and re_pin is None:
+        return None
+    try:
+        from machine import Pin
+    except ImportError:
+        raise RuntimeError("machine.Pin is required for RS-485 direction control")
+
+    re_active_low = bool(config.get("re_active_low", True))
+    pins = {"de": None, "re": None, "re_active_low": re_active_low}
+    if de_pin is not None:
+        pins["de"] = Pin(int(de_pin), Pin.OUT)
+        pins["de"].value(0)
+    if re_pin is not None:
+        pins["re"] = Pin(int(re_pin), Pin.OUT)
+        pins["re"].value(_rs485_receive_re_value(re_active_low))
+    return pins
+
+
+def _set_rs485_transmit(pins, transmitting):
+    """切换 RS-485 收发方向，/RE 按低电平有效处理。"""
+    if pins is None:
+        return
+    de = pins.get("de")
+    re = pins.get("re")
+    re_active_low = pins.get("re_active_low", True)
+    if transmitting:
+        if re is not None:
+            re.value(_rs485_transmit_re_value(re_active_low))
+        if de is not None:
+            de.value(1)
+    else:
+        if de is not None:
+            de.value(0)
+        if re is not None:
+            re.value(_rs485_receive_re_value(re_active_low))
+
+
+def _rs485_receive_re_value(active_low):
+    return 0 if active_low else 1
+
+
+def _rs485_transmit_re_value(active_low):
+    return 1 if active_low else 0
+
+
 def _fpioa_function(fpioa, FPIOA, name):
     function = getattr(FPIOA, name, None)
     if function is None:
@@ -422,6 +532,16 @@ def _fpioa_function(fpioa, FPIOA, name):
     if function is None:
         raise ValueError("unsupported FPIOA function: {}".format(name))
     return function
+
+
+def _ticks_ms():
+    try:
+        import time
+        if hasattr(time, "ticks_ms"):
+            return time.ticks_ms()
+        return int(time.time() * 1000)
+    except Exception:
+        return 0
 
 
 def _ticks_us():
@@ -442,6 +562,14 @@ def _json_loads(line):
     if not isinstance(line, str):
         line = line.decode()
     return json.loads(line)
+
+
+def _json_dumps(value):
+    try:
+        import ujson as json
+    except ImportError:
+        import json
+    return json.dumps(value)
 
 
 def _packet_vector(record, vector_name, scalar_names):

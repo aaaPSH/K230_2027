@@ -6,6 +6,25 @@
 COMM_CONFIG = {
     "enabled": False,
     "debug_print": False,
+    # 通过 UART4 输出关键制导调试数据，不使用控制台打印。
+    "debug_uart": {
+        "enabled": True,
+        "uart_id": "UART4",
+        "tx_pin": 29,
+        "rx_pin": 31,
+        # RS-485 收发控制脚：DE=26，/RE=32。
+        "de_pin": 26,
+        "re_pin": 32,
+        # 常见 RS-485 芯片的 /RE 为低电平有效。
+        "re_active_low": True,
+        "baudrate": 115200,
+        "bits": 8,
+        "parity": "none",
+        "stop": 1,
+        "timeout": 0,
+        # 50 ms 约为 20 Hz，适合 115200 波特率。
+        "debug_period_ms": 50,
+    },
     "imu": {
         "enabled": True,
         "transport": "uart",
