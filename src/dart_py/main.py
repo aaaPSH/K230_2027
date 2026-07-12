@@ -131,6 +131,10 @@ def step_guidance(
         guidance_result["sensor_timestamp_match"] = attitude_state.get(
             "timestamp_match", False
         )
+        guidance_result["sensor_source_timestamp_us"] = attitude_state.get(
+            "source_timestamp_us"
+        )
+        guidance_result["sensor_gyro_held"] = attitude_state.get("gyro_held", False)
 
     command = build_overload_command(
         detection,

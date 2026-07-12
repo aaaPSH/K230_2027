@@ -43,19 +43,20 @@ ImuInterface = GyroInterface
 
 
 class UartImuInterface(GyroInterface):
-    """从 UART 流中接收以换行符分帧的 IMU 报文。
+    """从 UART 流中接收 IMU 报文。
 
-    默认 CSV 报文紧凑，足以支持高速链路::
+    默认协议为固定长度二进制帧：小端 IEEE-754 ``float32 * 9``，共 36 字节。
+    前六个 float 的发送顺序为::
 
-        ay,ax,az,pitch,roll,yaw\\n
+        ay,ax,az,gy,gx,gz,reserved_0,reserved_1,reserved_2
 
-    串口顺序保持发送方的 ``ay,ax,az,pitch,roll,yaw``；字段映射会将其
-    重排为制导使用的 ``accel_b=[ax,ay,az]``、``gyro_b=[roll,pitch,yaw]``。
+    字段映射会先重排为 ``accel=[ax,ay,az]``、``gyro=[gx,gy,gz]``，再通过
+    可配置装配矩阵转换为制导使用的镖体系 ``accel_b``、``gyro_b``。
     当 ``packet_format`` 设为 ``"json"`` 时也接受 JSON 行，例如::
 
         {"gyro_b":[gx,gy,gz],"accel_b":[ax,ay,az],"gpio":{"armed":1}}\\n
 
-    默认情况下，报文时间戳在 K230 收到完整的 UART 行时生成。
+    默认情况下，报文时间戳在 K230 收到完整 UART 帧时生成。
     这使得图像和传感器数据共享同一时间基准。
     仅当发送方的 ``timestamp_us`` 已与 K230 的 ``time.ticks_us()``
     时钟同步时，才选择 ``timestamp_source="packet"``。
@@ -69,11 +70,32 @@ class UartImuInterface(GyroInterface):
         self.timestamp_source = self.config.get("timestamp_source", "arrival")
         self.csv_fields = self.config.get(
             "csv_fields",
-            ["ay", "ax", "az", "pitch", "roll", "yaw"],
+            ["ay", "ax", "az", "gy", "gx", "gz"],
         )
         self.accel_fields = self.config.get("accel_fields", ["ax", "ay", "az"])
-        self.gyro_fields = self.config.get("gyro_fields", ["roll", "pitch", "yaw"])
+        self.gyro_fields = self.config.get("gyro_fields", ["gx", "gy", "gz"])
         self.gyro_unit = self.config.get("gyro_unit", "rad_s")
+        self.accel_to_body = _axis_transform(
+            self.config.get("accel_to_body", _identity_matrix()),
+            "accel_to_body",
+        )
+        self.gyro_to_body = _axis_transform(
+            self.config.get("gyro_to_body", _identity_matrix()),
+            "gyro_to_body",
+        )
+        self.frame_bytes = int(self.config.get("frame_bytes", 0))
+        self.binary_fields = self.config.get(
+            "binary_fields",
+            [
+                "ay", "ax", "az", "gy", "gx", "gz",
+                "reserved_0", "reserved_1", "reserved_2",
+            ],
+        )
+        if self.packet_format == "binary_float32_le":
+            if self.frame_bytes <= 0:
+                self.frame_bytes = len(self.binary_fields) * 4
+            if self.frame_bytes != len(self.binary_fields) * 4:
+                raise ValueError("binary frame_bytes must equal 4 * field count")
         self.max_line_bytes = max(32, int(self.config.get("max_line_bytes", 256)))
         self.max_pending_packets = max(
             1,
@@ -104,6 +126,10 @@ class UartImuInterface(GyroInterface):
             data = data.encode()
         self._rx_buffer.extend(data)
 
+        if self.packet_format == "binary_float32_le":
+            self._extract_binary_frames()
+            return
+
         while True:
             line_end = self._rx_buffer.find(b"\n")
             if line_end < 0:
@@ -117,6 +143,12 @@ class UartImuInterface(GyroInterface):
         if len(self._rx_buffer) > self.max_line_bytes:
             self._rx_buffer = bytearray()
             self.invalid_packet_count += 1
+
+    def _extract_binary_frames(self):
+        while len(self._rx_buffer) >= self.frame_bytes:
+            frame = bytes(self._rx_buffer[:self.frame_bytes])
+            del self._rx_buffer[:self.frame_bytes]
+            self._append_packet(frame)
 
     def _append_packet(self, line):
         try:
@@ -138,6 +170,8 @@ class UartImuInterface(GyroInterface):
             record = _json_loads(line)
         elif self.packet_format == "csv":
             record = self._parse_csv(line)
+        elif self.packet_format == "binary_float32_le":
+            record = self._parse_binary_frame(line)
         else:
             raise ValueError("unsupported UART IMU packet_format")
         if not isinstance(record, dict):
@@ -147,6 +181,8 @@ class UartImuInterface(GyroInterface):
         accel_b = _packet_vector(record, "accel_b", self.accel_fields)
         if gyro_b is None or accel_b is None:
             raise ValueError("UART IMU packet has no complete IMU vector")
+        accel_b = _mat_vec_mul(self.accel_to_body, accel_b)
+        gyro_b = _mat_vec_mul(self.gyro_to_body, gyro_b)
         gyro_b = _gyro_to_rad_s(gyro_b, self.gyro_unit)
 
         packet_timestamp_us = _packet_integer(record.get("timestamp_us"))
@@ -159,6 +195,10 @@ class UartImuInterface(GyroInterface):
             "gyro_b": gyro_b,
             "accel_b": accel_b,
         }
+        if self.packet_format == "binary_float32_le":
+            # Preserve all nine values for consumers that need the three
+            # protocol fields not used by the roll/guidance path yet.
+            sample["uart_fields"] = record
         if packet_timestamp_us is not None:
             sample["packet_timestamp_us"] = packet_timestamp_us
         if "gpio" in record:
@@ -181,6 +221,16 @@ class UartImuInterface(GyroInterface):
             if name:
                 record[name] = values[index].strip()
         return record
+
+    def _parse_binary_frame(self, frame):
+        if len(frame) != self.frame_bytes:
+            raise ValueError("UART binary frame length is invalid")
+        values = _unpack_float32_le(frame, len(self.binary_fields))
+        return {
+            name: values[index]
+            for index, name in enumerate(self.binary_fields)
+            if name
+        }
 
 
 class GPIOInterface:
@@ -408,11 +458,50 @@ def _packet_vector(record, vector_name, scalar_names):
         return None
 
 
+def _identity_matrix():
+    return [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+
+
+def _axis_transform(matrix, name):
+    if matrix is None or len(matrix) != 3:
+        raise ValueError("{} must be a 3x3 matrix".format(name))
+    result = []
+    for row in matrix:
+        if len(row) != 3:
+            raise ValueError("{} must be a 3x3 matrix".format(name))
+        try:
+            result.append([float(row[0]), float(row[1]), float(row[2])])
+        except (TypeError, ValueError, IndexError):
+            raise ValueError("{} contains a non-numeric value".format(name))
+    return result
+
+
+def _mat_vec_mul(matrix, vector):
+    return [
+        matrix[row][0] * vector[0]
+        + matrix[row][1] * vector[1]
+        + matrix[row][2] * vector[2]
+        for row in range(3)
+    ]
+
+
 def _packet_integer(value):
     try:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _unpack_float32_le(frame, count):
+    try:
+        import ustruct as struct
+    except ImportError:
+        import struct
+    return struct.unpack("<{}f".format(count), frame)
 
 
 def _gyro_to_rad_s(gyro_b, unit):

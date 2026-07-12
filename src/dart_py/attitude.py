@@ -112,6 +112,11 @@ class AttitudeWorker:
         )
         self.estimate_gyro_bias = bool(self.config.get("estimate_gyro_bias", True))
         self.accel_gravity_sign = float(self.config.get("accel_gravity_sign", -1.0))
+        self.hold_last_gyro = bool(self.config.get("hold_last_gyro", True))
+        self.max_hold_gyro_us = max(
+            self.sample_period_us,
+            int(self.config.get("max_hold_gyro_us", 250000)),
+        )
         self.roll_axis = int(self.config.get("roll_axis", 0))
         if self.roll_axis < 0 or self.roll_axis > 2:
             raise ValueError("roll_axis must be 0, 1, or 2")
@@ -141,6 +146,11 @@ class AttitudeWorker:
         self._init_accel_sum = [0.0, 0.0, 0.0]
         self._init_gyro_sum = [0.0, 0.0, 0.0]
         self._init_count = 0
+        self._last_gyro_b = None
+        self._last_accel_b = None
+        self._last_sensor_timestamp_us = None
+        self._last_sensor_gpio = None
+        self._last_uart_fields = None
         self.last_error = None
 
     @property
@@ -178,7 +188,7 @@ class AttitudeWorker:
         local_gpio = self._read_gpio()
         data = self.imu_interface.read() if self.imu_interface is not None else None
         if data is None:
-            return None
+            return self._hold_last_gyro(read_timestamp_us, local_gpio)
         if not isinstance(data, dict):
             raise ValueError("IMU read() must return a dictionary or None")
 
@@ -196,14 +206,53 @@ class AttitudeWorker:
         gpio = _merge_gpio(local_gpio, data.get("gpio"))
         self._update_roll(sample_timestamp_us, gyro_b, accel_b)
         corrected_gyro_b = self._correct_gyro(gyro_b)
+        self._last_gyro_b = gyro_b[:]
+        self._last_accel_b = accel_b[:]
+        self._last_sensor_timestamp_us = sample_timestamp_us
+        self._last_sensor_gpio = data.get("gpio")
+        self._last_uart_fields = data.get("uart_fields")
         sample = {
             "timestamp_us": sample_timestamp_us,
+            "source_timestamp_us": sample_timestamp_us,
             "roll_rad": self._roll_rad,
             "gyro_b": corrected_gyro_b,
             "accel_b": accel_b,
             "gpio": gpio,
             "initialized": self.initialized,
+            "gyro_held": False,
         }
+        if "uart_fields" in data:
+            sample["uart_fields"] = data["uart_fields"].copy()
+        self._append_history(sample)
+        return sample
+
+    def _hold_last_gyro(self, timestamp_us, local_gpio):
+        """Integrate with the last UART gyro sample between low-rate packets."""
+        if (
+            not self.hold_last_gyro
+            or not self.initialized
+            or self._last_gyro_b is None
+            or self._last_sensor_timestamp_us is None
+        ):
+            return None
+        source_age_us = ticks_diff(timestamp_us, self._last_sensor_timestamp_us)
+        if source_age_us < 0 or source_age_us > self.max_hold_gyro_us:
+            return None
+
+        self._update_roll(timestamp_us, self._last_gyro_b, self._last_accel_b)
+        sample = {
+            "timestamp_us": timestamp_us,
+            "source_timestamp_us": self._last_sensor_timestamp_us,
+            "roll_rad": self._roll_rad,
+            "gyro_b": self._correct_gyro(self._last_gyro_b),
+            "accel_b": self._last_accel_b[:],
+            "gpio": _merge_gpio(local_gpio, self._last_sensor_gpio),
+            "initialized": True,
+            "gyro_held": True,
+            "source_age_us": source_age_us,
+        }
+        if self._last_uart_fields is not None:
+            sample["uart_fields"] = self._last_uart_fields.copy()
         self._append_history(sample)
         return sample
 
@@ -346,6 +395,8 @@ def _copy_sample(sample):
     result["accel_b"] = sample["accel_b"][:]
     if sample["gpio"] is not None:
         result["gpio"] = sample["gpio"].copy()
+    if "uart_fields" in sample:
+        result["uart_fields"] = sample["uart_fields"].copy()
     return result
 
 

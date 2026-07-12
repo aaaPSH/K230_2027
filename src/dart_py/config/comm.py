@@ -1,8 +1,6 @@
 """通信、IMU 和 GPIO 参数。
 
-默认 IMU 传输使用换行符分帧的 UART 流。
-仅在需要不同的物理传输或报文协议时，在 ``comm.make_imu_interface``
-中使用 ``ImuInterface`` 的子类。
+默认 IMU 传输使用固定长度的 UART 二进制帧。
 """
 
 COMM_CONFIG = {
@@ -21,15 +19,31 @@ COMM_CONFIG = {
         "parity": "none",
         "stop": 1,
         "timeout": 0,
-        # 每次发送一个以换行符结尾的报文：
-        # ay,ax,az,pitch,roll,yaw
-        # 加速度按协议 ay,ax,az 发送，映射后为机体系 [ax,ay,az]。
-        # 后三项按 pitch,roll,yaw 发送，映射后为 [roll,pitch,yaw]。
-        "packet_format": "csv",
-        "csv_fields": ["ay", "ax", "az", "pitch", "roll", "yaw"],
+        # 固定帧：36 字节，小端 IEEE-754 float32，共 9 个值。
+        # 流中没有帧头/校验时，发送端必须从帧边界开始发送；UART 丢字节后
+        # 无法自动恢复对齐。
+        "packet_format": "binary_float32_le",
+        "frame_bytes": 36,
+        # 发送顺序：镖体系 ay,ax,az,gy,gx,gz；后三项含义尚未提供，先保留。
+        "binary_fields": [
+            "ay", "ax", "az", "gy", "gx", "gz",
+            "reserved_0", "reserved_1", "reserved_2",
+        ],
         "accel_fields": ["ax", "ay", "az"],
-        "gyro_fields": ["roll", "pitch", "yaw"],
-        # 若发送端已经输出 rad/s，则改为 "rad_s"。
+        "gyro_fields": ["gx", "gy", "gz"],
+        # 从 IMU 装配坐标转换到镖体系。符号/轴向未确认前使用单位阵；
+        # 确认后只修改矩阵，例如某轴反向可将对应对角元素设为 -1.0。
+        "accel_to_body": [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        "gyro_to_body": [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        # 当前按 rad/s 解释；若发送端输出度/秒，改为 "deg_s"。
         "gyro_unit": "rad_s",
         # "arrival" 使用 K230 UART 接收时间，因此与图像时间戳共享
         # 同一时钟。仅当发送方已同步时使用 "packet"。
@@ -38,16 +52,19 @@ COMM_CONFIG = {
         "max_pending_packets": 32,
     },
     "attitude": {
-        # 1 kHz 采样率，与相机/推理帧率无关。
+        # UART 约 10 Hz，但使用最近一次角速度在 1 kHz 线程中持续积分。
         "sample_period_us": 1000,
         "max_dt_us": 5000,
         # 在 1 kHz 默认值下覆盖 512 ms，包含检测器延迟。
         "history_size": 512,
         # 启动后采集静止样本，用于基于重力的初始滚转角和陀螺仪零偏估计。
         # 采集完成后开始积分。
-        "initial_roll_samples": 32,
+        "initial_roll_samples": 10,
         "stationary_gyro_rad_s": 0.15,
         "estimate_gyro_bias": True,
+        # 仅在最近一帧 UART 数据不超过 250 ms 时外推，避免断流无限积分。
+        "hold_last_gyro": True,
+        "max_hold_gyro_us": 250000,
         # 典型加速度计输出比力，即静止时为 -重力。
         # 如果 IMU 驱动已返回重力矢量，则设为 +1.0。
         "accel_gravity_sign": -1.0,
