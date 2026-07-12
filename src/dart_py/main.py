@@ -4,16 +4,17 @@ import os
 import time
 import sys
 
-PROJECT_PATH = "/sdcard/dart_py"
+# PROJECT_PATH = "/sdcard/dart_py"
 
-if PROJECT_PATH not in sys.path:
-    sys.path.append(PROJECT_PATH)
+# if PROJECT_PATH not in sys.path:
+#     sys.path.append(PROJECT_PATH)
 
 from media.sensor import *
 from media.display import *
 from media.media import *
 
-from comm import make_gyro_interface, make_lower_computer_interface
+from attitude import AttitudeWorker, ticks_us
+from comm import make_gpio_interface, make_imu_interface, make_lower_computer_interface
 from config.camera import CAMERA_CONFIG
 from config.comm import COMM_CONFIG
 from config.detector import DETECTOR_CONFIG
@@ -87,27 +88,23 @@ def init_display(display_config):
     )
 
 
-def read_gyro_state(gyro_interface):
-    data = gyro_interface.read()
-    if data is None:
-        return None, None
-    return (
-        data.get("roll_rad"),
-        data.get("gyro_b"),
-    )
-
-
 def step_guidance(
     detector,
     guidance,
     image,
     dt,
-    gyro_interface,
+    image_timestamp_us,
+    attitude_worker,
     lower_interface,
     clock,
 ):
     detection = detector.detect(image)
-    roll_rad, gyro_b = read_gyro_state(gyro_interface)
+    attitude_state = attitude_worker.state_at(image_timestamp_us)
+    roll_rad = None
+    gyro_b = None
+    if attitude_state is not None and attitude_state.get("timestamp_match", False):
+        roll_rad = attitude_state.get("roll_rad")
+        gyro_b = attitude_state.get("gyro_b")
 
     if detection.get("detected", False):
         guidance_result = guidance.update(
@@ -120,6 +117,20 @@ def step_guidance(
     else:
         guidance.predict_kalman(dt)
         guidance_result = guidance.lost_result()
+
+    # Keep alignment diagnostics with the guidance output.  They are useful
+    # when tuning UART baud rate, sensor rate, and the matching window.
+    if attitude_state is not None:
+        guidance_result["sensor_timestamp_us"] = attitude_state.get("timestamp_us")
+        guidance_result["sensor_timestamp_delta_us"] = attitude_state.get(
+            "timestamp_delta_us"
+        )
+        guidance_result["sensor_timestamp_error_us"] = attitude_state.get(
+            "timestamp_error_us"
+        )
+        guidance_result["sensor_timestamp_match"] = attitude_state.get(
+            "timestamp_match", False
+        )
 
     command = build_overload_command(
         detection,
@@ -137,10 +148,18 @@ def run():
     sensor_running = False
     display_inited = False
     media_inited = False
+    attitude_worker = None
     try:
         detector = Detector(**DETECTOR_CONFIG)
         guidance = make_guidance_from_config(CAMERA_CONFIG, GUIDANCE_CONFIG)
-        gyro_interface = make_gyro_interface(COMM_CONFIG)
+        imu_interface = make_imu_interface(COMM_CONFIG)
+        gpio_interface = make_gpio_interface(COMM_CONFIG)
+        attitude_worker = AttitudeWorker(
+            imu_interface,
+            gpio_interface,
+            COMM_CONFIG.get("attitude", {}),
+        )
+        attitude_worker.start()
         lower_interface = make_lower_computer_interface(COMM_CONFIG)
 
         sensor = create_sensor(CAMERA_CONFIG)
@@ -169,12 +188,17 @@ def run():
                 dt = 0.0
 
             image = sensor.snapshot(chn=channel_id)
+            # This timestamp is recorded as soon as the frame is returned.
+            # If the camera driver later exposes an exposure timestamp, pass
+            # that value here instead (using the same ticks_us() clock base).
+            image_timestamp_us = ticks_us()
             detection, guidance_result, command = step_guidance(
                 detector,
                 guidance,
                 image,
                 dt,
-                gyro_interface,
+                image_timestamp_us,
+                attitude_worker,
                 lower_interface,
                 clock,
             )
@@ -195,6 +219,8 @@ def run():
     except BaseException as exc:
         print("guidance loop error:", exc)
     finally:
+        if attitude_worker is not None:
+            attitude_worker.stop()
         if sensor is not None and sensor_running:
             sensor.stop()
         if display_inited:
