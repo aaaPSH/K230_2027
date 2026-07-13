@@ -5,7 +5,7 @@ DISPLAY_CONFIG = {
     "width": 320,
     "height": 240,
     "fps": 90,
-    "to_ide": True,
+    "to_ide": False,
     "quality": 90,
     "enabled": True,
     "show_fps": True,

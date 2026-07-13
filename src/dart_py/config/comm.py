@@ -4,9 +4,10 @@
 """
 
 COMM_CONFIG = {
-    "debug_print": False,
+    "debug_print": True,
     "diagnostics": {
-        "enabled": False,
+        # 低频控制台输出性能、目标、IMU 匹配、滚转及过载指令，用于排错。
+        "enabled": True,
         "period_ms": 1000,
     },
     "flight_log": {
@@ -32,7 +33,7 @@ COMM_CONFIG = {
         "writer_poll_ms": 10,
         "close_timeout_ms": 5000,
         # 排错阶段输出关键帧启用、入队、保存成功及后台写入错误。
-        "debug_print": True,
+        "debug_print": False,
     },
     "imu": {
         "enabled": True,
