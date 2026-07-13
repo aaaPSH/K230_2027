@@ -65,14 +65,7 @@ class RuntimeDiagnostics:
         self._detector_total_us = 0
         self._guidance_total_us = 0
         self._gc_total_us = 0
-        self._detected = False
-        self._target_x = None
-        self._target_y = None
-        self._target_area = 0.0
-        self._roll_rad = None
-        self._imu_match = False
-        self._yaw_command_g = 0.0
-        self._pitch_command_g = 0.0
+        self._latest_state = None
 
     def start_frame(self):
         return ticks_us()
@@ -92,21 +85,26 @@ class RuntimeDiagnostics:
         if self.enabled:
             self._guidance_total_us += elapsed_us
 
-    def record_state(self, detection, guidance_result, command):
-        """保存最近一帧关键状态，供低频控制台输出。"""
+    def record_state(
+        self,
+        frame_index,
+        image_timestamp_us,
+        fps,
+        detection,
+        guidance_result,
+        command,
+    ):
+        """保存最近一帧状态，供低频输出与 CSV 使用相同字段。"""
         if not self.enabled:
             return
-        detection = detection or {}
-        guidance_result = guidance_result or {}
-        command = command or {}
-        self._detected = bool(detection.get("detected", False))
-        self._target_x = detection.get("x")
-        self._target_y = detection.get("y")
-        self._target_area = detection.get("area", 0.0)
-        self._roll_rad = guidance_result.get("sensor_roll_rad")
-        self._imu_match = bool(guidance_result.get("sensor_timestamp_match", False))
-        self._yaw_command_g = command.get("yaw_overload_g", 0.0)
-        self._pitch_command_g = command.get("pitch_overload_g", 0.0)
+        self._latest_state = (
+            frame_index,
+            image_timestamp_us,
+            fps,
+            detection,
+            guidance_result,
+            command,
+        )
 
     def report_if_due(self, now_ms, attitude_worker, imu_interface, fps=None):
         if not self.enabled:
@@ -129,9 +127,7 @@ class RuntimeDiagnostics:
         print(
             "diag fps={:.1f} frame_ms={:.2f} detector_ms={:.2f} "
             "guidance_ms={:.2f} gc_ms={:.2f} imu_pending={} "
-            "imu_invalid={} attitude_error={} detected={} "
-            "target=({}, {}) area={} roll_rad={} imu_match={} "
-            "cmd_g=({}, {})".format(
+            "imu_invalid={} attitude_error={}".format(
                 fps,
                 self._frame_total_us / count / 1000.0,
                 self._detector_total_us / count / 1000.0,
@@ -140,31 +136,21 @@ class RuntimeDiagnostics:
                 pending,
                 invalid,
                 error or "none",
-                self._detected,
-                _format_diag_number(self._target_x),
-                _format_diag_number(self._target_y),
-                _format_diag_number(self._target_area),
-                _format_diag_number(self._roll_rad),
-                self._imu_match,
-                _format_diag_number(self._yaw_command_g),
-                _format_diag_number(self._pitch_command_g),
             )
         )
+        if self._latest_state is not None:
+            row = FlightLogger.build_row(*self._latest_state)
+            telemetry = " ".join(
+                "{}={}".format(FlightLogger.FIELDS[index], row[index])
+                for index in range(len(FlightLogger.FIELDS))
+            )
+            print("telemetry " + telemetry)
         self._last_report_ms = now_ms
         self._frame_count = 0
         self._frame_total_us = 0
         self._detector_total_us = 0
         self._guidance_total_us = 0
         self._gc_total_us = 0
-
-
-def _format_diag_number(value):
-    if value is None:
-        return "none"
-    try:
-        return "{:.3f}".format(float(value))
-    except (TypeError, ValueError):
-        return "invalid"
 
 
 def create_sensor(camera_config):
@@ -291,7 +277,9 @@ def run():
     lower_interface = None
     flight_logger = None
     keyframe_saver = None
-    diagnostics = RuntimeDiagnostics(COMM_CONFIG.get("diagnostics", {}))
+    diagnostics_config = COMM_CONFIG.get("diagnostics", {}).copy()
+    diagnostics_config["enabled"] = bool(COMM_CONFIG.get("debug_print", False))
+    diagnostics = RuntimeDiagnostics(diagnostics_config)
     try:
         flight_logger = FlightLogger(COMM_CONFIG.get("flight_log", {}))
         keyframe_saver = KeyframeSaver(COMM_CONFIG.get("keyframe", {}))
@@ -391,7 +379,14 @@ def run():
                 guidance_result,
                 command,
             )
-            diagnostics.record_state(detection, guidance_result, command)
+            diagnostics.record_state(
+                frame_index,
+                image_timestamp_us,
+                fps,
+                detection,
+                guidance_result,
+                command,
+            )
             diagnostics.report_if_due(get_millis(), attitude_worker, imu_interface, fps)
     except KeyboardInterrupt as exc:
         print("user stop:", exc)

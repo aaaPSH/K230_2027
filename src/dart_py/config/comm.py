@@ -4,10 +4,13 @@
 """
 
 COMM_CONFIG = {
+    # 输出 FlightLogger 的全部字段，但频率受 diagnostics.period_ms 限制。
     "debug_print": True,
+    # 仅在需要逐帧查看下发指令时启用；通常应保持关闭。
+    "command_debug_print": False,
     "diagnostics": {
-        # 低频控制台输出性能、目标、IMU 匹配、滚转及过载指令，用于排错。
-        "enabled": True,
+        # debug_print 控制是否启用；此处仅配置输出周期。
+        "enabled": False,
         "period_ms": 1000,
     },
     "flight_log": {

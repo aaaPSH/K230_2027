@@ -133,6 +133,34 @@ class FlightLogger:
             return
         self._raise_write_error()
 
+        row = self.build_row(
+            frame_index,
+            image_timestamp_us,
+            fps,
+            detection,
+            guidance_result,
+            command,
+        )
+        self._lock.acquire()
+        try:
+            self._active_buffer.append(",".join(row))
+            full = len(self._active_buffer) >= self.flush_interval_frames
+        finally:
+            self._lock.release()
+        if full:
+            self.flush()
+
+    @staticmethod
+    def build_row(
+        frame_index,
+        image_timestamp_us,
+        fps,
+        detection,
+        guidance_result,
+        command,
+    ):
+        """构造与 CSV 表头严格一致的一行遥测数据。"""
+
         detection = detection or {}
         guidance_result = guidance_result or {}
         command = command or {}
@@ -167,14 +195,7 @@ class FlightLogger:
             _number(command.get("yaw_overload_g")),
             _number(command.get("pitch_overload_g")),
         )
-        self._lock.acquire()
-        try:
-            self._active_buffer.append(",".join(row))
-            full = len(self._active_buffer) >= self.flush_interval_frames
-        finally:
-            self._lock.release()
-        if full:
-            self.flush()
+        return row
 
     def flush(self):
         """将当前缓冲交给后台写线程；此方法不执行文件 I/O。"""

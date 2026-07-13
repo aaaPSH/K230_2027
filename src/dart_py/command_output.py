@@ -32,6 +32,6 @@ class ConsoleCommandOutput(OverloadCommandOutput):
 
 
 def make_lower_computer_interface(config):
-    if config.get("debug_print", False):
+    if config.get("command_debug_print", False):
         return ConsoleCommandOutput(config)
     return OverloadCommandOutput(config)
