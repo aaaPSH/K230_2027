@@ -124,14 +124,10 @@ class FlightLogger:
         self,
         frame_index,
         image_timestamp_us,
-        dt,
         fps,
         detection,
         guidance_result,
         command,
-        gc_elapsed_us,
-        attitude_worker,
-        imu_interface,
     ):
         if not self.enabled:
             return
@@ -140,23 +136,16 @@ class FlightLogger:
         detection = detection or {}
         guidance_result = guidance_result or {}
         command = command or {}
-        bbox = detection.get("bbox") or (None, None, None, None)
         gyro_b = guidance_result.get("sensor_gyro_b") or (None, None, None)
 
         row = (
             _integer(frame_index),
             _integer(image_timestamp_us),
-            _number(dt),
             _number(fps),
             _flag(detection.get("detected")),
             _number(detection.get("x")),
             _number(detection.get("y")),
-            _integer(bbox[0]),
-            _integer(bbox[1]),
-            _integer(bbox[2]),
-            _integer(bbox[3]),
             _number(detection.get("area")),
-            _number(detection.get("circularity")),
             _number(detection.get("green_ratio")),
             _integer(guidance_result.get("sensor_timestamp_us")),
             _integer(guidance_result.get("sensor_timestamp_delta_us")),
@@ -177,10 +166,6 @@ class FlightLogger:
             _flag(command.get("detected")),
             _number(command.get("yaw_overload_g")),
             _number(command.get("pitch_overload_g")),
-            _integer(gc_elapsed_us),
-            _integer(getattr(imu_interface, "pending_packet_count", 0)),
-            _integer(getattr(imu_interface, "invalid_packet_count", 0)),
-            _integer(getattr(attitude_worker, "error_count", 0)),
         )
         self._lock.acquire()
         try:

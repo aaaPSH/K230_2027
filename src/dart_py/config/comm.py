@@ -11,7 +11,7 @@ COMM_CONFIG = {
     },
     "flight_log": {
         # 赛前可保持关闭；调参、飞行测试和赛后复盘时设为 True。
-        "enabled": False,
+        "enabled": True,
         "directory": "/data/logs",
         # 缓冲 60 帧后写入 SD 卡，避免逐帧文件 I/O 拖慢视觉回路。
         "flush_interval_frames": 60,
@@ -23,7 +23,7 @@ COMM_CONFIG = {
     },
     "keyframe": {
         # 保存带可视化叠加的 JPEG；文件名含帧号和图像时间戳，可对应 CSV。
-        "enabled": False,
+        "enabled": True,
         "directory": "/data/logs/keyframes",
         # 持续锁定时每 60 帧额外保存一张，避免逐帧写入图片。
         "interval_frames": 60,
