@@ -26,6 +26,10 @@ from guidance import build_overload_command, make_guidance_from_config
 from visualization import draw_visualization
 
 
+# GC 不需要每帧执行；45 帧约对应 90 FPS 下每 0.5 秒执行一次。
+GC_COLLECT_INTERVAL_FRAMES = 45
+
+
 def get_millis():
     if hasattr(time, "ticks_ms"):
         return time.ticks_ms()
@@ -261,8 +265,10 @@ def run():
         channel_id = CAMERA_CONFIG["channel_id"]
         max_dt_sec = GUIDANCE_CONFIG.get("max_dt_sec", 0.2)
         fps = 0.0
+        frame_index = 0
 
         while True:
+            frame_index += 1
             frame_start_us = diagnostics.start_frame()
             os.exitpoint()
             clock.tick()
@@ -309,11 +315,14 @@ def run():
             if DISPLAY_CONFIG.get("enabled", True):
                 Display.show_image(image)
 
-            gc_start_us = ticks_us()
-            gc.collect()
+            gc_elapsed_us = 0
+            if frame_index % GC_COLLECT_INTERVAL_FRAMES == 0:
+                gc_start_us = ticks_us()
+                gc.collect()
+                gc_elapsed_us = ticks_diff(ticks_us(), gc_start_us)
             diagnostics.record_frame(
                 frame_start_us,
-                ticks_diff(ticks_us(), gc_start_us),
+                gc_elapsed_us,
             )
             diagnostics.report_if_due(get_millis(), attitude_worker, imu_interface, fps)
     except KeyboardInterrupt as exc:
