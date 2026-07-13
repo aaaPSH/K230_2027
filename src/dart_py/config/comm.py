@@ -9,6 +9,31 @@ COMM_CONFIG = {
         "enabled": False,
         "period_ms": 1000,
     },
+    "flight_log": {
+        # 赛前可保持关闭；调参、飞行测试和赛后复盘时设为 True。
+        "enabled": False,
+        "directory": "/data/logs",
+        # 缓冲 60 帧后写入 SD 卡，避免逐帧文件 I/O 拖慢视觉回路。
+        "flush_interval_frames": 60,
+        # 后台写线程轮询缓冲区的间隔；主视觉线程不执行日志文件写入。
+        "writer_poll_ms": 10,
+        # 程序退出时等待后台写完最后一批日志的最长时间。
+        "close_timeout_ms": 5000,
+        "file_prefix": "flight",
+    },
+    "keyframe": {
+        # 保存带可视化叠加的 JPEG；文件名含帧号和图像时间戳，可对应 CSV。
+        "enabled": False,
+        "directory": "/data/logs/keyframes",
+        # 持续锁定时每 60 帧额外保存一张，避免逐帧写入图片。
+        "interval_frames": 60,
+        # 最多保留 4 个等待 JPEG 编码/写盘的图像副本，避免占用过多内存。
+        "max_pending_frames": 4,
+        "writer_poll_ms": 10,
+        "close_timeout_ms": 5000,
+        "save_on_lock": True,
+        "save_on_lost": True,
+    },
     "imu": {
         "enabled": True,
         "transport": "uart",

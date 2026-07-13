@@ -199,10 +199,7 @@ class ProportionalGuidance:
         yaw_angle_control = yaw_angle_gain * yaw_angle
         pitch_angle_control = pitch_angle_gain * pitch_angle
         yaw_command_rate = yaw_rate_control + yaw_angle_control
-
-        # 当前制导行为中保留 pitch_angle_control_gain 参数，但暂不将其
-        # 叠加到 pitch command rate，避免改变现有控制结果。
-        pitch_command_rate = pitch_rate_control
+        pitch_command_rate = pitch_rate_control + pitch_angle_control
 
         yaw_overload_g = (
             self.yaw_navigation_ratio

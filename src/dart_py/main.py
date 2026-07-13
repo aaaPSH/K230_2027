@@ -22,7 +22,9 @@ from config.detector import DETECTOR_CONFIG
 from config.display import DISPLAY_CONFIG
 from config.guidance import GUIDANCE_CONFIG
 from detector import Detector
+from flight_log import FlightLogger
 from guidance import build_overload_command, make_guidance_from_config
+from keyframe import KeyframeSaver
 from visualization import draw_visualization
 
 
@@ -218,6 +220,11 @@ def step_guidance(
         guidance_result["sensor_source_timestamp_us"] = attitude_state.get(
             "source_timestamp_us"
         )
+        guidance_result["sensor_initialized"] = attitude_state.get(
+            "initialized", False
+        )
+        guidance_result["sensor_roll_rad"] = attitude_state.get("roll_rad")
+        guidance_result["sensor_gyro_b"] = attitude_state.get("gyro_b")
         guidance_result["sensor_gyro_held"] = attitude_state.get("gyro_held", False)
 
     command = build_overload_command(
@@ -239,8 +246,12 @@ def run():
     attitude_worker = None
     imu_interface = None
     lower_interface = None
+    flight_logger = None
+    keyframe_saver = None
     diagnostics = RuntimeDiagnostics(COMM_CONFIG.get("diagnostics", {}))
     try:
+        flight_logger = FlightLogger(COMM_CONFIG.get("flight_log", {}))
+        keyframe_saver = KeyframeSaver(COMM_CONFIG.get("keyframe", {}))
         detector = Detector(**DETECTOR_CONFIG)
         guidance = make_guidance_from_config(CAMERA_CONFIG, GUIDANCE_CONFIG)
         imu_interface = make_imu_interface(COMM_CONFIG)
@@ -312,6 +323,12 @@ def run():
                 guidance_result=guidance_result,
                 config=DISPLAY_CONFIG,
             )
+            keyframe_saver.save_if_needed(
+                image,
+                frame_index,
+                image_timestamp_us,
+                detection.get("detected", False),
+            )
             if DISPLAY_CONFIG.get("enabled", True):
                 Display.show_image(image)
 
@@ -324,12 +341,24 @@ def run():
                 frame_start_us,
                 gc_elapsed_us,
             )
+            flight_logger.record(
+                frame_index,
+                image_timestamp_us,
+                fps,
+                detection,
+                guidance_result,
+                command,
+            )
             diagnostics.report_if_due(get_millis(), attitude_worker, imu_interface, fps)
     except KeyboardInterrupt as exc:
         print("user stop:", exc)
     except Exception as exc:
         print("guidance loop error:", exc)
     finally:
+        if keyframe_saver is not None:
+            keyframe_saver.close()
+        if flight_logger is not None:
+            flight_logger.close()
         if attitude_worker is not None:
             attitude_worker.stop()
             attitude_worker.join()
