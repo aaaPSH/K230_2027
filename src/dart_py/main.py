@@ -78,7 +78,7 @@ class RuntimeDiagnostics:
         if self.enabled:
             self._guidance_total_us += elapsed_us
 
-    def report_if_due(self, now_ms, attitude_worker, imu_interface):
+    def report_if_due(self, now_ms, attitude_worker, imu_interface, fps=None):
         if not self.enabled:
             return
         if (
@@ -94,11 +94,13 @@ class RuntimeDiagnostics:
         pending = getattr(imu_interface, "pending_packet_count", 0)
         invalid = getattr(imu_interface, "invalid_packet_count", 0)
         error = getattr(attitude_worker, "last_error", None)
+        if fps is None:
+            fps = self._frame_count * 1000.0 / max(1, millis_diff(now_ms, self._last_report_ms))
         print(
             "diag fps={:.1f} frame_ms={:.2f} detector_ms={:.2f} "
             "guidance_ms={:.2f} gc_ms={:.2f} imu_pending={} "
             "imu_invalid={} attitude_error={}".format(
-                self._frame_count * 1000.0 / max(1, millis_diff(now_ms, self._last_report_ms)),
+                fps,
                 self._frame_total_us / count / 1000.0,
                 self._detector_total_us / count / 1000.0,
                 self._guidance_total_us / count / 1000.0,
@@ -167,7 +169,7 @@ def step_guidance(
     image_timestamp_us,
     attitude_worker,
     lower_interface,
-    clock,
+    fps,
     diagnostics=None,
 ):
     detector_start_us = ticks_us() if diagnostics is not None else None
@@ -217,7 +219,7 @@ def step_guidance(
     command = build_overload_command(
         detection,
         guidance_result,
-        fps=clock.fps(),
+        fps=fps,
         dt=dt,
         config=GUIDANCE_CONFIG,
     )
@@ -258,6 +260,7 @@ def run():
         last_frame_ms = get_millis()
         channel_id = CAMERA_CONFIG["channel_id"]
         max_dt_sec = GUIDANCE_CONFIG.get("max_dt_sec", 0.2)
+        fps = 0.0
 
         while True:
             frame_start_us = diagnostics.start_frame()
@@ -270,6 +273,14 @@ def run():
             if dt <= 0.0 or dt > max_dt_sec:
                 guidance.reset()
                 dt = 0.0
+
+            # 基于 dt 的 EMA 平滑 FPS，每帧更新，反映当前真实帧率。
+            if dt > 0.0:
+                instant_fps = 1.0 / dt
+                if fps == 0.0:
+                    fps = instant_fps
+                else:
+                    fps += 0.1 * (instant_fps - fps)
 
             image = sensor.snapshot(chn=channel_id)
             # 此时间戳在图像帧返回时立即记录。
@@ -284,7 +295,7 @@ def run():
                 image_timestamp_us,
                 attitude_worker,
                 lower_interface,
-                clock,
+                fps,
                 diagnostics,
             )
 
@@ -304,7 +315,7 @@ def run():
                 frame_start_us,
                 ticks_diff(ticks_us(), gc_start_us),
             )
-            diagnostics.report_if_due(get_millis(), attitude_worker, imu_interface)
+            diagnostics.report_if_due(get_millis(), attitude_worker, imu_interface, fps)
     except KeyboardInterrupt as exc:
         print("user stop:", exc)
     except Exception as exc:
