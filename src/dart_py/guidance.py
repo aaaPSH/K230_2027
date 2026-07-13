@@ -200,8 +200,8 @@ class ProportionalGuidance:
         pitch_angle_control = pitch_angle_gain * pitch_angle
         yaw_command_rate = yaw_rate_control + yaw_angle_control
 
-        # Match the current C++ guidance.hpp behavior: pitch angle control exists
-        # as a parameter but is not added to the pitch command rate.
+        # 当前制导行为中保留 pitch_angle_control_gain 参数，但暂不将其
+        # 叠加到 pitch command rate，避免改变现有控制结果。
         pitch_command_rate = pitch_rate_control
 
         yaw_overload_g = (

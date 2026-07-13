@@ -13,8 +13,9 @@ from media.sensor import *
 from media.display import *
 from media.media import *
 
-from attitude import AttitudeWorker, ticks_us
-from comm import make_gpio_interface, make_imu_interface, make_lower_computer_interface
+from attitude import AttitudeWorker, ticks_diff, ticks_us
+from command_output import make_lower_computer_interface
+from imu_uart import make_imu_interface
 from config.camera import CAMERA_CONFIG
 from config.comm import COMM_CONFIG
 from config.detector import DETECTOR_CONFIG
@@ -43,6 +44,76 @@ def sleep_ms(milliseconds):
         time.sleep_ms(milliseconds)
     else:
         time.sleep(milliseconds / 1000.0)
+
+
+class RuntimeDiagnostics:
+    """默认关闭的低频运行性能汇总。"""
+
+    def __init__(self, config=None):
+        config = config or {}
+        self.enabled = bool(config.get("enabled", False))
+        self.period_ms = max(100, int(config.get("period_ms", 1000)))
+        self._last_report_ms = None
+        self._frame_count = 0
+        self._frame_total_us = 0
+        self._detector_total_us = 0
+        self._guidance_total_us = 0
+        self._gc_total_us = 0
+
+    def start_frame(self):
+        return ticks_us()
+
+    def record_frame(self, frame_start_us, gc_us):
+        if not self.enabled:
+            return
+        self._frame_count += 1
+        self._frame_total_us += ticks_diff(ticks_us(), frame_start_us)
+        self._gc_total_us += gc_us
+
+    def record_detector(self, elapsed_us):
+        if self.enabled:
+            self._detector_total_us += elapsed_us
+
+    def record_guidance(self, elapsed_us):
+        if self.enabled:
+            self._guidance_total_us += elapsed_us
+
+    def report_if_due(self, now_ms, attitude_worker, imu_interface):
+        if not self.enabled:
+            return
+        if (
+            self._last_report_ms is not None
+            and millis_diff(now_ms, self._last_report_ms) < self.period_ms
+        ):
+            return
+        if self._last_report_ms is None:
+            self._last_report_ms = now_ms
+            return
+
+        count = max(1, self._frame_count)
+        pending = getattr(imu_interface, "pending_packet_count", 0)
+        invalid = getattr(imu_interface, "invalid_packet_count", 0)
+        error = getattr(attitude_worker, "last_error", None)
+        print(
+            "diag fps={:.1f} frame_ms={:.2f} detector_ms={:.2f} "
+            "guidance_ms={:.2f} gc_ms={:.2f} imu_pending={} "
+            "imu_invalid={} attitude_error={}".format(
+                self._frame_count * 1000.0 / max(1, millis_diff(now_ms, self._last_report_ms)),
+                self._frame_total_us / count / 1000.0,
+                self._detector_total_us / count / 1000.0,
+                self._guidance_total_us / count / 1000.0,
+                self._gc_total_us / count / 1000.0,
+                pending,
+                invalid,
+                error or "none",
+            )
+        )
+        self._last_report_ms = now_ms
+        self._frame_count = 0
+        self._frame_total_us = 0
+        self._detector_total_us = 0
+        self._guidance_total_us = 0
+        self._gc_total_us = 0
 
 
 def create_sensor(camera_config):
@@ -97,8 +168,12 @@ def step_guidance(
     attitude_worker,
     lower_interface,
     clock,
+    diagnostics=None,
 ):
+    detector_start_us = ticks_us() if diagnostics is not None else None
     detection = detector.detect(image)
+    if diagnostics is not None:
+        diagnostics.record_detector(ticks_diff(ticks_us(), detector_start_us))
     attitude_state = attitude_worker.state_at(image_timestamp_us)
     roll_rad = None
     gyro_b = None
@@ -106,6 +181,7 @@ def step_guidance(
         roll_rad = attitude_state.get("roll_rad")
         gyro_b = attitude_state.get("gyro_b")
 
+    guidance_start_us = ticks_us() if diagnostics is not None else None
     if detection.get("detected", False):
         guidance_result = guidance.update(
             detection["x"],
@@ -117,6 +193,8 @@ def step_guidance(
     else:
         guidance.predict_kalman(dt)
         guidance_result = guidance.lost_result()
+    if diagnostics is not None:
+        diagnostics.record_guidance(ticks_diff(ticks_us(), guidance_start_us))
 
     # 将时间对齐诊断信息附加到引导输出中。
     # 在调优 UART 波特率、传感器速率和匹配窗口时很有用。
@@ -153,14 +231,15 @@ def run():
     display_inited = False
     media_inited = False
     attitude_worker = None
+    imu_interface = None
+    lower_interface = None
+    diagnostics = RuntimeDiagnostics(COMM_CONFIG.get("diagnostics", {}))
     try:
         detector = Detector(**DETECTOR_CONFIG)
         guidance = make_guidance_from_config(CAMERA_CONFIG, GUIDANCE_CONFIG)
         imu_interface = make_imu_interface(COMM_CONFIG)
-        gpio_interface = make_gpio_interface(COMM_CONFIG)
         attitude_worker = AttitudeWorker(
             imu_interface,
-            gpio_interface,
             COMM_CONFIG.get("attitude", {}),
         )
         attitude_worker.start()
@@ -181,6 +260,7 @@ def run():
         max_dt_sec = GUIDANCE_CONFIG.get("max_dt_sec", 0.2)
 
         while True:
+            frame_start_us = diagnostics.start_frame()
             os.exitpoint()
             clock.tick()
 
@@ -205,6 +285,7 @@ def run():
                 attitude_worker,
                 lower_interface,
                 clock,
+                diagnostics,
             )
 
             draw_visualization(
@@ -217,14 +298,25 @@ def run():
             if DISPLAY_CONFIG.get("enabled", True):
                 Display.show_image(image)
 
+            gc_start_us = ticks_us()
             gc.collect()
+            diagnostics.record_frame(
+                frame_start_us,
+                ticks_diff(ticks_us(), gc_start_us),
+            )
+            diagnostics.report_if_due(get_millis(), attitude_worker, imu_interface)
     except KeyboardInterrupt as exc:
         print("user stop:", exc)
-    except BaseException as exc:
+    except Exception as exc:
         print("guidance loop error:", exc)
     finally:
         if attitude_worker is not None:
             attitude_worker.stop()
+            attitude_worker.join()
+        if imu_interface is not None and hasattr(imu_interface, "deinit"):
+            imu_interface.deinit()
+        if lower_interface is not None and hasattr(lower_interface, "deinit"):
+            lower_interface.deinit()
         if sensor is not None and sensor_running:
             sensor.stop()
         if display_inited:

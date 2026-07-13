@@ -1,7 +1,7 @@
-"""高频 IMU/GPIO 采样与带时间戳的滚转姿态查询。
+"""高频 IMU 采样与带时间戳的滚转姿态查询。
 
 相机/引导回路不应直接读取 IMU：推理和显示可能使该回路延迟数毫秒。
-``AttitudeWorker`` 独占 IMU 和 GPIO 读取，在自己的线程中积分滚转角，
+``AttitudeWorker`` 独占 IMU 读取，在自己的线程中积分滚转角，
 并维护一份带时间戳的短历史记录供相机回路查询。
 """
 import math
@@ -83,7 +83,7 @@ def _wrap_pi(angle_rad):
 
 
 class AttitudeWorker:
-    """以固定速率采样 IMU/GPIO，并提供图像时刻的姿态信息。
+    """以固定速率采样 IMU，并提供图像时刻的姿态信息。
 
     IMU ``read()`` 数据使用与 ``guidance.py`` 相同的机体坐标系约定：
     ``[x 前, y 右, z 下]``。必须提供 ``gyro_b``（rad/s）和
@@ -95,9 +95,8 @@ class AttitudeWorker:
     所有传入 ``state_at`` 的图像时间戳必须使用同一时钟。
     """
 
-    def __init__(self, imu_interface, gpio_interface=None, config=None):
+    def __init__(self, imu_interface, config=None):
         self.imu_interface = imu_interface
-        self.gpio_interface = gpio_interface
         self.config = config or {}
 
         self.sample_period_us = max(100, int(self.config.get("sample_period_us", 1000)))
@@ -140,6 +139,7 @@ class AttitudeWorker:
         self._lock = _make_lock()
         self._running = False
         self._thread_started = False
+        self._thread = None
         self._last_sample_us = None
         self._roll_rad = None
         self._gyro_bias = [0.0, 0.0, 0.0]
@@ -149,9 +149,10 @@ class AttitudeWorker:
         self._last_gyro_b = None
         self._last_accel_b = None
         self._last_sensor_timestamp_us = None
-        self._last_sensor_gpio = None
         self._last_uart_fields = None
         self.last_error = None
+        self.last_error_type = None
+        self.error_count = 0
 
     @property
     def initialized(self):
@@ -169,6 +170,7 @@ class AttitudeWorker:
         if threading is not None:
             worker = threading.Thread(target=self._run)
             worker.daemon = True
+            self._thread = worker
             worker.start()
             return
 
@@ -180,15 +182,18 @@ class AttitudeWorker:
         """请求工作线程退出循环；此处不关闭接口。"""
         self._running = False
 
+    def join(self, timeout_ms=100):
+        """等待 CPython 线程退出；CanMV 线程环境下执行最佳努力停止。"""
+        worker = self._thread
+        if worker is not None and hasattr(worker, "join"):
+            worker.join(max(0, timeout_ms) / 1000.0)
+
     def sample_once(self, timestamp_us=None):
-        """读取一次 IMU/GPIO 样本。适用于单线程测试移植。"""
+        """读取一次 IMU 样本。适用于单线程测试移植。"""
         read_timestamp_us = ticks_us() if timestamp_us is None else timestamp_us
-        # GPIO 与 IMU 按相同的高频周期采样。先读取 GPIO 还能
-        # 在 IMU 总线暂时故障时保持物理输入处于活跃状态。
-        local_gpio = self._read_gpio()
         data = self.imu_interface.read() if self.imu_interface is not None else None
         if data is None:
-            return self._hold_last_gyro(read_timestamp_us, local_gpio)
+            return self._hold_last_gyro(read_timestamp_us)
         if not isinstance(data, dict):
             raise ValueError("IMU read() must return a dictionary or None")
 
@@ -203,13 +208,11 @@ class AttitudeWorker:
         except (TypeError, ValueError):
             sample_timestamp_us = read_timestamp_us
 
-        gpio = _merge_gpio(local_gpio, data.get("gpio"))
         self._update_roll(sample_timestamp_us, gyro_b, accel_b)
         corrected_gyro_b = self._correct_gyro(gyro_b)
         self._last_gyro_b = gyro_b[:]
         self._last_accel_b = accel_b[:]
         self._last_sensor_timestamp_us = sample_timestamp_us
-        self._last_sensor_gpio = data.get("gpio")
         self._last_uart_fields = data.get("uart_fields")
         sample = {
             "timestamp_us": sample_timestamp_us,
@@ -217,7 +220,6 @@ class AttitudeWorker:
             "roll_rad": self._roll_rad,
             "gyro_b": corrected_gyro_b,
             "accel_b": accel_b,
-            "gpio": gpio,
             "initialized": self.initialized,
             "gyro_held": False,
         }
@@ -226,7 +228,7 @@ class AttitudeWorker:
         self._append_history(sample)
         return sample
 
-    def _hold_last_gyro(self, timestamp_us, local_gpio):
+    def _hold_last_gyro(self, timestamp_us):
         """Integrate with the last UART gyro sample between low-rate packets."""
         if (
             not self.hold_last_gyro
@@ -246,7 +248,6 @@ class AttitudeWorker:
             "roll_rad": self._roll_rad,
             "gyro_b": self._correct_gyro(self._last_gyro_b),
             "accel_b": self._last_accel_b[:],
-            "gpio": _merge_gpio(local_gpio, self._last_sensor_gpio),
             "initialized": True,
             "gyro_held": True,
             "source_age_us": source_age_us,
@@ -257,7 +258,7 @@ class AttitudeWorker:
         return sample
 
     def state_at(self, image_timestamp_us, max_age_us=None):
-        """返回距图像时间戳最近的 IMU/GPIO 状态。
+        """返回距图像时间戳最近的 IMU 状态。
 
         查询会考虑图像时间两侧的样本，选择绝对时间戳差最小的。
         这对 UART 流很重要：相机可能在两个 IMU 报文之间运行。
@@ -306,10 +307,12 @@ class AttitudeWorker:
             try:
                 self.sample_once()
                 self.last_error = None
-            except BaseException as exc:
-                # 间歇性的 I2C/SPI 读取错误不应永久终止姿态更新。
+            except Exception as exc:
+                # 间歇性的 UART 读取错误不应永久终止姿态更新。
                 # 主循环可以检查 last_error。
                 self.last_error = str(exc)
+                self.last_error_type = type(exc).__name__
+                self.error_count += 1
 
             next_sample_us = ticks_add(next_sample_us, self.sample_period_us)
             remaining_us = ticks_diff(next_sample_us, ticks_us())
@@ -318,16 +321,6 @@ class AttitudeWorker:
             else:
                 # 慢速读取后不累积过大的调度误差。
                 next_sample_us = ticks_us()
-
-    def _read_gpio(self):
-        if self.gpio_interface is None:
-            return None
-        gpio = self.gpio_interface.read()
-        if gpio is None:
-            return None
-        if isinstance(gpio, dict):
-            return gpio.copy()
-        return {"value": gpio}
 
     def _update_roll(self, timestamp_us, gyro_b, accel_b):
         if self._roll_rad is None:
@@ -393,24 +386,6 @@ def _copy_sample(sample):
     result = sample.copy()
     result["gyro_b"] = sample["gyro_b"][:]
     result["accel_b"] = sample["accel_b"][:]
-    if sample["gpio"] is not None:
-        result["gpio"] = sample["gpio"].copy()
     if "uart_fields" in sample:
         result["uart_fields"] = sample["uart_fields"].copy()
-    return result
-
-
-def _merge_gpio(local_gpio, sensor_gpio):
-    """合并本地 GPIO 引脚与通过 UART 发送的可选 GPIO 字段。"""
-    if local_gpio is None and sensor_gpio is None:
-        return None
-    result = {}
-    if isinstance(local_gpio, dict):
-        result.update(local_gpio)
-    elif local_gpio is not None:
-        result["local_value"] = local_gpio
-    if isinstance(sensor_gpio, dict):
-        result.update(sensor_gpio)
-    elif sensor_gpio is not None:
-        result["sensor_value"] = sensor_gpio
     return result

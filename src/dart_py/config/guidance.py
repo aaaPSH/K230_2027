@@ -35,6 +35,7 @@ GUIDANCE_CONFIG = {
     "yaw_closing_velocity": 14.0,
     "pitch_closing_velocity": 14.0,
     "yaw_angle_control_gain": 0.0,
+    # 当前制导公式暂不将俯仰角控制项叠加到 pitch command rate；保留作后续标定参数。
     "pitch_angle_control_gain": 0.0,
     "rate_filter_alpha": -1.0,
     "use_kalman_filter": True,
