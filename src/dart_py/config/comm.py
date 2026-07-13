@@ -25,14 +25,14 @@ COMM_CONFIG = {
         # 保存带可视化叠加的 JPEG；文件名含帧号和图像时间戳，可对应 CSV。
         "enabled": True,
         "directory": "/data/logs/keyframes",
-        # 持续锁定时每 60 帧额外保存一张，避免逐帧写入图片。
+        # 不依赖识别状态，每 60 帧保存一张，避免逐帧写入图片。
         "interval_frames": 60,
         # 最多保留 4 个等待 JPEG 编码/写盘的图像副本，避免占用过多内存。
         "max_pending_frames": 4,
         "writer_poll_ms": 10,
         "close_timeout_ms": 5000,
-        "save_on_lock": True,
-        "save_on_lost": True,
+        # 排错阶段输出关键帧启用、入队、保存成功及后台写入错误。
+        "debug_print": True,
     },
     "imu": {
         "enabled": True,

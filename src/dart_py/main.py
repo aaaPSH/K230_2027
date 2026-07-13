@@ -327,7 +327,6 @@ def run():
                 image,
                 frame_index,
                 image_timestamp_us,
-                detection.get("detected", False),
             )
             if DISPLAY_CONFIG.get("enabled", True):
                 Display.show_image(image)

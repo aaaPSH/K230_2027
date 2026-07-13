@@ -55,20 +55,17 @@ def _ticks_diff(newer, older):
 
 
 class KeyframeSaver:
-    """主线程复制关键帧，后台线程异步编码并写入 JPEG。"""
+    """主线程按固定帧间隔复制关键帧，后台线程异步写入 JPEG。"""
 
     def __init__(self, config=None):
         config = config or {}
         self.enabled = bool(config.get("enabled", False))
         self.directory = config.get("directory", "/sdcard/dart_py/logs/keyframes")
         self.interval_frames = max(1, int(config.get("interval_frames", 60)))
-        self.save_on_lock = bool(config.get("save_on_lock", True))
-        self.save_on_lost = bool(config.get("save_on_lost", True))
         self.max_pending_frames = max(1, int(config.get("max_pending_frames", 4)))
         self.writer_poll_ms = max(1, int(config.get("writer_poll_ms", 10)))
         self.close_timeout_ms = max(100, int(config.get("close_timeout_ms", 5000)))
-        self._was_detected = False
-        self._last_saved_frame = None
+        self.debug_print = bool(config.get("debug_print", False))
         self._lock = _make_lock()
         self._pending_frames = []
         self._running = False
@@ -81,34 +78,27 @@ class KeyframeSaver:
             self._running = True
             self._writer_active = True
             self._start_writer()
+            self._debug(
+                "keyframe enabled directory={} interval_frames={} queue_limit={}".format(
+                    self.directory,
+                    self.interval_frames,
+                    self.max_pending_frames,
+                )
+            )
 
-    def save_if_needed(self, image, frame_index, image_timestamp_us, detected):
-        """复制当前带标注图像并交给后台保存，返回目标路径或 None。"""
+    def save_if_needed(self, image, frame_index, image_timestamp_us):
+        """按固定帧间隔复制当前带标注图像并交给后台保存。"""
         if not self.enabled:
             return None
         self._raise_write_error()
 
-        event = None
-        if detected:
-            if not self._was_detected and self.save_on_lock:
-                event = "lock"
-            elif (
-                self._last_saved_frame is None
-                or frame_index - self._last_saved_frame >= self.interval_frames
-            ):
-                event = "track"
-        elif self._was_detected and self.save_on_lost:
-            event = "lost"
-
-        if event is None:
-            self._was_detected = bool(detected)
+        if frame_index % self.interval_frames != 0:
             return None
 
-        path = "{}/frame_{:06d}_{}_{}.jpg".format(
+        path = "{}/frame_{:06d}_{}.jpg".format(
             self.directory.rstrip("/"),
             int(frame_index),
             int(image_timestamp_us),
-            event,
         )
         # 原始图像在下一次 snapshot() 后可能被复用；只在关键帧复制，
         # JPEG 编码和 SD 卡写入均在后台线程执行。
@@ -118,11 +108,12 @@ class KeyframeSaver:
             if len(self._pending_frames) >= self.max_pending_frames:
                 raise RuntimeError("keyframe writer queue is full")
             self._pending_frames.append((image_copy, path))
+            pending_count = len(self._pending_frames)
         finally:
             self._lock.release()
 
-        self._was_detected = bool(detected)
-        self._last_saved_frame = frame_index
+        self._debug("keyframe queued pending={} path={}".format(pending_count, path))
+
         return path
 
     def close(self):
@@ -162,7 +153,7 @@ class KeyframeSaver:
                 if frame is not None:
                     image, path = frame
                     image.save(path)
-                    print("keyframe:", path)
+                    self._debug("keyframe saved path={}".format(path))
                     continue
                 if not self._is_running():
                     return
@@ -200,12 +191,14 @@ class KeyframeSaver:
             self._lock.release()
 
     def _set_write_error(self, exc):
+        error = "{}: {}".format(type(exc).__name__, exc)
         self._lock.acquire()
         try:
-            self._write_error = "{}: {}".format(type(exc).__name__, exc)
+            self._write_error = error
             self._running = False
         finally:
             self._lock.release()
+        self._debug("keyframe writer error={}".format(error))
 
     def _raise_write_error(self):
         self._lock.acquire()
@@ -215,6 +208,10 @@ class KeyframeSaver:
             self._lock.release()
         if error is not None:
             raise RuntimeError("keyframe writer error: {}".format(error))
+
+    def _debug(self, message):
+        if self.debug_print:
+            print(message)
 
 
 def _ensure_directory(directory):
