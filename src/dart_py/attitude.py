@@ -292,6 +292,11 @@ class AttitudeWorker:
             return None
 
         result = _copy_sample(best_sample)
+        # 姿态初始化完成前 roll_rad 为 None；对外返回数值，避免调试输出
+        # 在初始化窗口内直接进行角度换算时触发 TypeError。
+        # 通过 initialized 字段保留真实的初始化状态，调用方仍可显示等待中。
+        if result.get("roll_rad") is None:
+            result["roll_rad"] = 0.0
         # 正差值表示传感器样本比图像更新；
         # 负差值表示样本在图像之前采集。
         result["timestamp_delta_us"] = best_delta_us

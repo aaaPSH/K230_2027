@@ -85,7 +85,7 @@ class SerialImuReader(ImuInterface):
 
         while len(self._rx_buffer) >= IMU_FRAME_BYTES:
             frame = bytes(self._rx_buffer[:IMU_FRAME_BYTES])
-            del self._rx_buffer[:IMU_FRAME_BYTES]
+            self._rx_buffer = self._rx_buffer[IMU_FRAME_BYTES:]
             self._append_packet(frame)
 
     def _append_packet(self, frame):
