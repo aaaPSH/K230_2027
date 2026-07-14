@@ -74,6 +74,8 @@ COMM_CONFIG = {
         # 仅在最近一帧 UART 数据不超过 250 ms 时外推，避免断流无限积分。
         "hold_last_gyro": True,
         "max_hold_gyro_us": 250000,
+        # 10 Hz IMU 最多容忍约 1.5 个报文周期；超过后禁止非零制导输出。
+        "max_source_age_us": 150000,
         # 典型加速度计输出比力，即静止时为 -重力。
         # 如果 IMU 驱动已返回重力矢量，则设为 +1.0。
         "accel_gravity_sign": -1.0,

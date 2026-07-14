@@ -79,6 +79,14 @@ class FlightLogger:
         "command_detected",
         "command_yaw_overload_g",
         "command_pitch_overload_g",
+        "guidance_valid",
+        "guidance_predicted",
+        "prediction_age_s",
+        "sensor_valid",
+        "relative_yaw_los_rate_rad_s",
+        "relative_pitch_los_rate_rad_s",
+        "gyro_yaw_los_rate_correction_rad_s",
+        "gyro_pitch_los_rate_correction_rad_s",
 
     )
 
@@ -194,6 +202,14 @@ class FlightLogger:
             _flag(command.get("detected")),
             _number(command.get("yaw_overload_g")),
             _number(command.get("pitch_overload_g")),
+            _flag(guidance_result.get("guidance_valid")),
+            _flag(guidance_result.get("predicted")),
+            _number(guidance_result.get("prediction_age_s")),
+            _flag(guidance_result.get("sensor_valid")),
+            _number(guidance_result.get("relative_yaw_los_rate_rad_s")),
+            _number(guidance_result.get("relative_pitch_los_rate_rad_s")),
+            _number(guidance_result.get("gyro_yaw_los_rate_correction_rad_s")),
+            _number(guidance_result.get("gyro_pitch_los_rate_correction_rad_s")),
         )
         return row
 

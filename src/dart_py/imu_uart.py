@@ -1,4 +1,5 @@
 """普通 UART IMU 通信接口。"""
+import math
 
 IMU_FRAME_BYTES = 36
 IMU_FLOAT_COUNT = 9
@@ -91,12 +92,16 @@ class SerialImuReader(ImuInterface):
     def _append_packet(self, frame):
         try:
             packet = self._parse_packet(frame)
-        except (TypeError, ValueError, IndexError):
+        except (TypeError, ValueError, IndexError) as exc:
             self.invalid_packet_count += 1
-            return
+            # 排错阶段禁止吞掉坏帧：后台姿态线程会将该异常上报主循环并中断。
+            raise ValueError("invalid UART IMU frame #{}: {}".format(
+                self.invalid_packet_count,
+                exc,
+            ))
         if packet is None:
             self.invalid_packet_count += 1
-            return
+            raise ValueError("UART IMU parser returned an empty packet")
         self._pending_packets.append(packet)
         if len(self._pending_packets) > self.max_pending_packets:
             # 保留最新样本，防止图像匹配滞后。
@@ -121,6 +126,8 @@ class SerialImuReader(ImuInterface):
         if len(frame) != IMU_FRAME_BYTES:
             raise ValueError("UART binary frame length is invalid")
         values = _unpack_float32_le(frame, IMU_FLOAT_COUNT)
+        if not all(_is_finite(value) for value in values):
+            raise ValueError("UART binary frame contains non-finite float")
         return {
             "ax": values[0],
             "ay": values[1],
@@ -291,3 +298,11 @@ def _unpack_float32_le(frame, count):
     except ImportError:
         import struct
     return struct.unpack("<{}f".format(count), frame)
+
+
+def _is_finite(value):
+    """拒绝 NaN/Inf，避免非法 IMU 数据污染姿态积分。"""
+    try:
+        return math.isfinite(value)
+    except AttributeError:
+        return value == value and value != float("inf") and value != -float("inf")

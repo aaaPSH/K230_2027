@@ -112,14 +112,22 @@ function cfg = default_guidance_config()
     cfg.G = 9.80665;
     cfg.EPS = 1e-9;
 
-    cfg.image_width = 640.0;
-    cfg.image_height = 480.0;
-    cfg.fov_x_deg = 60.0;
-    cfg.fov_y_deg = 45.0;
-    cfg.cx = cfg.image_width * 0.5;
-    cfg.cy = cfg.image_height * 0.5;
-    cfg.fx = focal_length(cfg.image_width, cfg.fov_x_deg);
-    cfg.fy = focal_length(cfg.image_height, cfg.fov_y_deg);
+    % 与 src/dart_py/config/camera.py、guidance.py 的实机默认值同步。
+    cfg.image_width = 320.0;
+    cfg.image_height = 240.0;
+    cfg.fov_x_deg = 65.0;
+    cfg.fov_y_deg = 40.0;
+    % 与运行时一致，内参矩阵是像素到 LOS 的唯一标定入口。
+    cfg.camera_matrix = [
+        251.149692, 0.0, 160.0;
+        0.0, 329.697290, 120.0;
+        0.0, 0.0, 1.0
+    ];
+    cfg.fx = cfg.camera_matrix(1, 1);
+    cfg.fy = cfg.camera_matrix(2, 2);
+    cfg.cx = cfg.camera_matrix(1, 3);
+    cfg.cy = cfg.camera_matrix(2, 3);
+    cfg.camera_skew = cfg.camera_matrix(1, 2);
 
     % Camera x-right/y-down/z-forward -> body x-forward/y-right/z-down.
     cfg.R_bc = [
@@ -128,11 +136,11 @@ function cfg = default_guidance_config()
         0.0, 1.0, 0.0
     ];
 
-    cfg.navigation_ratio = 0.0;
-    cfg.closing_velocity = 16.60;
+    cfg.navigation_ratio = 3.0;
+    cfg.closing_velocity = 14.0;
     cfg.position_to_rate_gain = 0.0;
-    cfg.yaw_angle_control_gain = 2.0;
-    cfg.pitch_angle_control_gain = 2.0;
+    cfg.yaw_angle_control_gain = 0.0;
+    cfg.pitch_angle_control_gain = 0.0;
     cfg.rate_filter_alpha = NaN;
     cfg.use_kalman_filter = true;
 
@@ -140,12 +148,16 @@ function cfg = default_guidance_config()
     cfg.kalman_rate_variance = 1.0;
     cfg.kalman_process_angle_variance = 0.0001;
     cfg.kalman_process_rate_variance = 0.02;
-    cfg.kalman_measurement_angle_variance = 3.3e-6;
-    cfg.kalman_measurement_rate_variance = 0.023;
+    cfg.kalman_measurement_noise_px = 1.0;
+    cfg.kalman_yaw_measurement_angle_variance = ...
+        atan(cfg.kalman_measurement_noise_px / cfg.fx)^2;
+    cfg.kalman_pitch_measurement_angle_variance = ...
+        atan(cfg.kalman_measurement_noise_px / cfg.fy)^2;
+    cfg.max_prediction_time_s = 0.1;
 
-    cfg.max_overload_g = 2.0;
+    cfg.max_overload_g = 0.5;
     cfg.roll_compensation = true;
-    cfg.roll_sign = 1.0;
+    cfg.roll_sign = -1.0;
 end
 
 function scene = default_launch_scene()
@@ -227,6 +239,7 @@ function [true_x, true_y, meas_x, meas_y, log_data, sim, hit_result] = run_close
     actual_pitch_overload_g = 0.0;
     next_camera_time = 0.0;
     last_camera_time = NaN;
+    last_camera_R_wb = [];
     camera_period_s = 1.0 / scene.camera_frame_rate_hz;
     time_eps = 1e-9;
 
@@ -275,12 +288,25 @@ function [true_x, true_y, meas_x, meas_y, log_data, sim, hit_result] = run_close
             end
             last_camera_time = t(k);
 
+            camera_gyro_b = zeros(3, 1);
+            if ~isempty(last_camera_R_wb) && frame_dt > 0.0
+                R_dot = (R_wb - last_camera_R_wb) / frame_dt;
+                omega_skew_b = R_wb.' * R_dot;
+                omega_skew_b = 0.5 * (omega_skew_b - omega_skew_b.');
+                camera_gyro_b = [
+                    omega_skew_b(3, 2);
+                    omega_skew_b(1, 3);
+                    omega_skew_b(2, 1)
+                ];
+            end
+            last_camera_R_wb = R_wb;
+
             [held_out, state] = guidance_step( ...
                 meas_x(k), ...
                 meas_y(k), ...
                 frame_dt, ...
                 0.0, ...
-                [0.0; 0.0; 0.0], ...
+                camera_gyro_b, ...
                 state, ...
                 cfg);
         elseif ~scene.command_hold_between_frames
@@ -518,12 +544,16 @@ end
 function [pixel_x, pixel_y] = body_vector_to_pixel(vector_b, cfg)
     % guidance.py maps camera [x-right, y-down, z-forward] to body
     % [x-forward, y-right, z-down], so camera x/z = body y/x.
-    pixel_x = cfg.cx + cfg.fx * vector_b(2) / vector_b(1);
-    pixel_y = cfg.cy + cfg.fy * vector_b(3) / vector_b(1);
+    x_n = vector_b(2) / vector_b(1);
+    y_n = vector_b(3) / vector_b(1);
+    pixel_x = cfg.cx + cfg.fx * x_n + cfg.camera_skew * y_n;
+    pixel_y = cfg.cy + cfg.fy * y_n;
 end
 
 function state = init_guidance_state()
     state.last_los_b = [];
+    state.last_los_s = [];
+    state.prediction_age_s = 0.0;
     state.filtered_yaw_dot = 0.0;
     state.filtered_pitch_dot = 0.0;
     state.has_filtered_rate = false;
@@ -563,10 +593,12 @@ end
 
 function [out, state] = guidance_step(target_x, target_y, dt, roll_rad, gyro_b, state, cfg)
     if target_x < 0.0 || target_y < 0.0
-        state = init_guidance_state();
-        out = lost_result();
+        [out, state] = guidance_predict(dt, roll_rad, gyro_b, state, cfg);
         return;
     end
+    state.prediction_age_s = 0.0;
+    filter_was_initialized = ...
+        state.yaw_filter.initialized && state.pitch_filter.initialized;
 
     if ~cfg.roll_compensation
         roll_rad = 0.0;
@@ -581,17 +613,25 @@ function [out, state] = guidance_step(target_x, target_y, dt, roll_rad, gyro_b, 
 
     [yaw_angle, pitch_angle] = los_angles(los_s);
     [los_dot_b, state] = los_dot_body(los_b, dt, state);
-    los_dot_true_b = los_dot_b + cross(gyro_b(:), los_b);
-    los_dot_s = R_roll_comp * los_dot_true_b;
-    [yaw_dot, pitch_dot] = los_angle_rates(los_s, los_dot_s, cfg.EPS);
+    [los_dot_s, relative_rate_valid, state] = los_dot_stable(los_s, dt, state);
+    [relative_yaw_dot, relative_pitch_dot] = ...
+        los_angle_rates(los_s, los_dot_s, cfg.EPS);
+    [gyro_yaw_dot, gyro_pitch_dot] = ...
+        gyro_rate_correction(los_s, gyro_b, R_roll_comp, cfg.EPS);
+    if ~relative_rate_valid && ~filter_was_initialized
+        gyro_yaw_dot = 0.0;
+        gyro_pitch_dot = 0.0;
+    end
 
     raw_yaw_angle = yaw_angle;
     raw_pitch_angle = pitch_angle;
-    raw_yaw_dot = yaw_dot;
-    raw_pitch_dot = pitch_dot;
+    raw_yaw_dot = relative_yaw_dot + gyro_yaw_dot;
+    raw_pitch_dot = relative_pitch_dot + gyro_pitch_dot;
 
     [yaw_angle, yaw_dot, pitch_angle, pitch_dot, state] = ...
-        filter_los_states(yaw_angle, yaw_dot, pitch_angle, pitch_dot, dt, state, cfg);
+        filter_los_states( ...
+            yaw_angle, relative_yaw_dot, pitch_angle, relative_pitch_dot, ...
+            dt, gyro_yaw_dot, gyro_pitch_dot, state, cfg);
 
     yaw_angle_gain = cfg.position_to_rate_gain + cfg.yaw_angle_control_gain;
     pitch_angle_gain = cfg.position_to_rate_gain + cfg.pitch_angle_control_gain;
@@ -601,10 +641,16 @@ function [out, state] = guidance_step(target_x, target_y, dt, roll_rad, gyro_b, 
     pitch_angle_control = pitch_angle_gain * pitch_angle;
     yaw_command_rate = yaw_rate_control + yaw_angle_control;
     pitch_command_rate = pitch_rate_control + pitch_angle_control;
-    yaw_overload_g = cfg.navigation_ratio * cfg.closing_velocity * yaw_command_rate / cfg.G;
-    pitch_overload_g = cfg.navigation_ratio * cfg.closing_velocity * pitch_command_rate / cfg.G;
+    stable_yaw_overload_g = cfg.navigation_ratio * cfg.closing_velocity * yaw_command_rate / cfg.G;
+    stable_pitch_overload_g = cfg.navigation_ratio * cfg.closing_velocity * pitch_command_rate / cfg.G;
+    % PN 律在滚转稳定系计算；执行机构使用弹体系 y/z 通道，故需逆变换。
+    body_overload = R_roll_comp.' * [0.0; stable_yaw_overload_g; stable_pitch_overload_g];
+    yaw_overload_g = body_overload(2);
+    pitch_overload_g = body_overload(3);
 
     out.detected = true;
+    out.predicted = false;
+    out.guidance_valid = true;
     out.pixel_error_x = target_x - cfg.cx;
     out.pixel_error_y = target_y - cfg.cy;
     out.yaw_los_angle_rad = yaw_angle;
@@ -625,8 +671,69 @@ function [out, state] = guidance_step(target_x, target_y, dt, roll_rad, gyro_b, 
     out.pitch_overload_g = limit_overload(pitch_overload_g, cfg.max_overload_g);
 end
 
+function [out, state] = guidance_predict(dt, roll_rad, gyro_b, state, cfg)
+    state.last_los_b = [];
+    state.last_los_s = [];
+    if ~state.yaw_filter.initialized || ~state.pitch_filter.initialized
+        out = lost_result();
+        return;
+    end
+    if isempty(dt) || dt <= 0.0
+        dt = 0.0;
+    end
+    state.prediction_age_s = state.prediction_age_s + dt;
+    if cfg.max_prediction_time_s <= 0.0 || ...
+            state.prediction_age_s > cfg.max_prediction_time_s + cfg.EPS
+        state = init_guidance_state();
+        out = lost_result();
+        return;
+    end
+    if ~cfg.roll_compensation
+        roll_rad = 0.0;
+    end
+    roll_rad = roll_rad * cfg.roll_sign;
+    current_yaw_angle = state.yaw_filter.x(1);
+    current_pitch_angle = state.pitch_filter.x(1);
+    los_s = los_from_angles(current_yaw_angle, current_pitch_angle);
+    R_roll_comp = roll_compensation_matrix(roll_rad);
+    [gyro_yaw_dot, gyro_pitch_dot] = ...
+        gyro_rate_correction(los_s, gyro_b, R_roll_comp, cfg.EPS);
+    state.yaw_filter = ...
+        predict_axis_filter(state.yaw_filter, dt, gyro_yaw_dot, cfg);
+    state.pitch_filter = ...
+        predict_axis_filter(state.pitch_filter, dt, gyro_pitch_dot, cfg);
+    yaw_angle = state.yaw_filter.x(1);
+    yaw_dot = state.yaw_filter.x(2);
+    pitch_angle = state.pitch_filter.x(1);
+    pitch_dot = state.pitch_filter.x(2);
+    yaw_angle_control = (cfg.position_to_rate_gain + cfg.yaw_angle_control_gain) * yaw_angle;
+    pitch_angle_control = (cfg.position_to_rate_gain + cfg.pitch_angle_control_gain) * pitch_angle;
+    yaw_command_rate = yaw_dot + yaw_angle_control;
+    pitch_command_rate = pitch_dot + pitch_angle_control;
+    stable_yaw_g = cfg.navigation_ratio * cfg.closing_velocity * yaw_command_rate / cfg.G;
+    stable_pitch_g = cfg.navigation_ratio * cfg.closing_velocity * pitch_command_rate / cfg.G;
+    body_overload = R_roll_comp.' * [0.0; stable_yaw_g; stable_pitch_g];
+    out = lost_result();
+    out.predicted = true;
+    out.guidance_valid = true;
+    out.yaw_los_angle_rad = yaw_angle;
+    out.pitch_los_angle_rad = pitch_angle;
+    out.yaw_los_rate_rad_s = yaw_dot;
+    out.pitch_los_rate_rad_s = pitch_dot;
+    out.yaw_rate_control_rad_s = yaw_dot;
+    out.pitch_rate_control_rad_s = pitch_dot;
+    out.yaw_angle_control_rad_s = yaw_angle_control;
+    out.pitch_angle_control_rad_s = pitch_angle_control;
+    out.yaw_command_rate_rad_s = yaw_command_rate;
+    out.pitch_command_rate_rad_s = pitch_command_rate;
+    out.yaw_overload_g = limit_overload(body_overload(2), cfg.max_overload_g);
+    out.pitch_overload_g = limit_overload(body_overload(3), cfg.max_overload_g);
+end
+
 function out = lost_result()
     out.detected = false;
+    out.predicted = false;
+    out.guidance_valid = false;
     out.pixel_error_x = 0.0;
     out.pixel_error_y = 0.0;
     out.yaw_los_angle_rad = 0.0;
@@ -648,8 +755,8 @@ function out = lost_result()
 end
 
 function los_c = pixel_to_camera_los(target_x, target_y, cfg)
-    x_n = (target_x - cfg.cx) / cfg.fx;
     y_n = (target_y - cfg.cy) / cfg.fy;
+    x_n = (target_x - cfg.cx - cfg.camera_skew * y_n) / cfg.fx;
     los_c = normalize_vec([x_n; y_n; 1.0], cfg.EPS);
 end
 
@@ -662,6 +769,27 @@ function [los_dot_b, state] = los_dot_body(los_b, dt, state)
 
     los_dot_b = (los_b - state.last_los_b) / dt;
     state.last_los_b = los_b;
+end
+
+function [los_dot_s, valid, state] = los_dot_stable(los_s, dt, state)
+    if isempty(state.last_los_s) || isempty(dt) || dt <= 0.0
+        state.last_los_s = los_s;
+        los_dot_s = zeros(3, 1);
+        valid = false;
+        return;
+    end
+    los_dot_s = (los_s - state.last_los_s) / dt;
+    state.last_los_s = los_s;
+    valid = true;
+end
+
+function [yaw_dot, pitch_dot] = gyro_rate_correction(los_s, gyro_b, R_roll_comp, eps_value)
+    gyro_s = R_roll_comp * gyro_b(:);
+    % 滚转稳定系已移除绕前向轴的转动，只补偿俯仰和偏航分量。
+    gyro_s(1) = 0.0;
+    los_dot_correction_s = cross(gyro_s, los_s);
+    [yaw_dot, pitch_dot] = ...
+        los_angle_rates(los_s, los_dot_correction_s, eps_value);
 end
 
 function R = roll_compensation_matrix(roll_rad)
@@ -681,6 +809,15 @@ function [yaw_angle, pitch_angle] = los_angles(los_s)
     rho = sqrt(x * x + y * y);
     yaw_angle = atan2(y, x);
     pitch_angle = atan2(-z, rho);
+end
+
+function los_s = los_from_angles(yaw_angle, pitch_angle)
+    cos_pitch = cos(pitch_angle);
+    los_s = [
+        cos_pitch * cos(yaw_angle);
+        cos_pitch * sin(yaw_angle);
+        -sin(pitch_angle)
+    ];
 end
 
 function [yaw_dot, pitch_dot] = los_angle_rates(los_s, los_dot_s, eps_value)
@@ -704,22 +841,34 @@ function [yaw_dot, pitch_dot] = los_angle_rates(los_s, los_dot_s, eps_value)
 end
 
 function [yaw_angle, yaw_dot, pitch_angle, pitch_dot, state] = ...
-    filter_los_states(yaw_angle, yaw_dot, pitch_angle, pitch_dot, dt, state, cfg)
+    filter_los_states( ...
+        yaw_angle, yaw_dot, pitch_angle, pitch_dot, dt, ...
+        gyro_yaw_dot, gyro_pitch_dot, state, cfg)
 
     if cfg.use_kalman_filter
         [yaw_angle, yaw_dot, state.yaw_filter] = ...
-            filter_axis_state(state.yaw_filter, yaw_angle, yaw_dot, dt, cfg);
+            filter_axis_state( ...
+                state.yaw_filter, yaw_angle, yaw_dot, dt, ...
+                gyro_yaw_dot, cfg.kalman_yaw_measurement_angle_variance, cfg);
         [pitch_angle, pitch_dot, state.pitch_filter] = ...
-            filter_axis_state(state.pitch_filter, pitch_angle, pitch_dot, dt, cfg);
+            filter_axis_state( ...
+                state.pitch_filter, pitch_angle, pitch_dot, dt, ...
+                gyro_pitch_dot, cfg.kalman_pitch_measurement_angle_variance, cfg);
         return;
     end
 
     [yaw_dot, pitch_dot, state] = filter_los_rates(yaw_dot, pitch_dot, state, cfg);
+    yaw_dot = yaw_dot + gyro_yaw_dot;
+    pitch_dot = pitch_dot + gyro_pitch_dot;
 end
 
-function [angle, rate, axis_filter] = filter_axis_state(axis_filter, angle, rate, dt, cfg)
+function [angle, rate, axis_filter] = ...
+    filter_axis_state( ...
+        axis_filter, angle, rate, dt, gyro_rate_correction, measurement_variance, cfg)
     if ~axis_filter.initialized
-        axis_filter = create_axis_filter(angle, rate, cfg);
+        % 与 K230 运行时一致：仅视觉 LOS 角是量测，初始角速度置零。
+        axis_filter = create_axis_filter(angle, cfg);
+        rate = 0.0;
         return;
     end
 
@@ -731,43 +880,70 @@ function [angle, rate, axis_filter] = filter_axis_state(axis_filter, angle, rate
         1.0, dt;
         0.0, 1.0
     ];
-    z = [angle; rate];
-    [axis_filter.x, axis_filter.P] = kalman_step(axis_filter.x, axis_filter.P, A, z, cfg);
+    [axis_filter.x, axis_filter.P, reset_filter] = ...
+        kalman_angle_step( ...
+            axis_filter.x, axis_filter.P, A, angle, dt, ...
+            gyro_rate_correction, measurement_variance, cfg);
+    if reset_filter
+        axis_filter = create_axis_filter(angle, cfg);
+    end
     angle = axis_filter.x(1);
     rate = axis_filter.x(2);
 end
 
-function axis_filter = create_axis_filter(angle, rate, cfg)
+function axis_filter = create_axis_filter(angle, cfg)
     axis_filter.initialized = true;
-    axis_filter.x = [angle; rate];
+    axis_filter.x = [angle; 0.0];
     axis_filter.P = [
         cfg.kalman_angle_variance, 0.0;
         0.0, cfg.kalman_rate_variance
     ];
 end
 
-function [x, P] = kalman_step(x, P, A, z, cfg)
-    H = eye(2);
+function [x, P, reset_filter] = ...
+    kalman_angle_step( ...
+        x, P, A, angle, dt, gyro_rate_correction, measurement_variance, cfg)
+    H = [1.0, 0.0];
+    q = cfg.kalman_process_rate_variance;
     Q = [
-        cfg.kalman_process_angle_variance, 0.0;
-        0.0, cfg.kalman_process_rate_variance
+        q * dt^3 / 3.0, q * dt^2 / 2.0;
+        q * dt^2 / 2.0, q * dt
     ];
-    R = [
-        cfg.kalman_measurement_angle_variance, 0.0;
-        0.0, cfg.kalman_measurement_rate_variance
-    ];
+    R = measurement_variance;
+    reset_filter = false;
 
     x = A * x;
+    % 状态速度定义为惯性 LOS rate；相对角预测需扣除稳定系自身角位移。
+    x(1) = x(1) - gyro_rate_correction * dt;
     P = A * P * A.' + Q;
 
-    residual = z - H * x;
+    residual = angle - H * x;
     S = H * P * H.' + R;
+    if S <= cfg.EPS || residual * residual > 9.0 * S
+        reset_filter = true;
+        return;
+    end
     K = P * H.' / S;
     x = x + K * residual;
 
     I = eye(2);
     I_KH = I - K * H;
     P = I_KH * P * I_KH.' + K * R * K.';
+end
+
+function axis_filter = predict_axis_filter(axis_filter, dt, gyro_rate_correction, cfg)
+    A = [
+        1.0, dt;
+        0.0, 1.0
+    ];
+    q = cfg.kalman_process_rate_variance;
+    Q = [
+        q * dt^3 / 3.0, q * dt^2 / 2.0;
+        q * dt^2 / 2.0, q * dt
+    ];
+    axis_filter.x = A * axis_filter.x;
+    axis_filter.x(1) = axis_filter.x(1) - gyro_rate_correction * dt;
+    axis_filter.P = A * axis_filter.P * A.' + Q;
 end
 
 function [yaw_dot, pitch_dot, state] = filter_los_rates(yaw_dot, pitch_dot, state, cfg)

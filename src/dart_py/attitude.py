@@ -69,7 +69,10 @@ def _copy_vector(vector):
     try:
         if len(vector) < 3:
             return None
-        return [float(vector[0]), float(vector[1]), float(vector[2])]
+        result = [float(vector[0]), float(vector[1]), float(vector[2])]
+        if not all(_is_finite(value) for value in result):
+            return None
+        return result
     except (TypeError, ValueError, IndexError):
         return None
 
@@ -80,6 +83,15 @@ def _wrap_pi(angle_rad):
     while angle_rad <= -math.pi:
         angle_rad += 2.0 * math.pi
     return angle_rad
+
+
+def _is_finite(value):
+    """兼容精简 MicroPython math 模块的有限数检查。"""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return False
+    return value == value and value != float("inf") and value != -float("inf")
 
 
 class AttitudeWorker:
@@ -222,6 +234,7 @@ class AttitudeWorker:
             "accel_b": accel_b,
             "initialized": self.initialized,
             "gyro_held": False,
+            "source_age_us": 0,
         }
         if "uart_fields" in data:
             sample["uart_fields"] = data["uart_fields"].copy()
@@ -292,9 +305,8 @@ class AttitudeWorker:
             return None
 
         result = _copy_sample(best_sample)
-        # 姿态初始化完成前 roll_rad 为 None；对外返回数值，避免调试输出
-        # 在初始化窗口内直接进行角度换算时触发 TypeError。
-        # 通过 initialized 字段保留真实的初始化状态，调用方仍可显示等待中。
+        # 为兼容日志和可视化的数值格式，初始化窗口内返回 0.0；调用方必须
+        # 以 initialized 字段判断该滚转值是否可用于制导补偿。
         if result.get("roll_rad") is None:
             result["roll_rad"] = 0.0
         # 正差值表示传感器样本比图像更新；
@@ -313,11 +325,12 @@ class AttitudeWorker:
                 self.sample_once()
                 self.last_error = None
             except Exception as exc:
-                # 间歇性的 UART 读取错误不应永久终止姿态更新。
-                # 主循环可以检查 last_error。
+                # 当前处于排错模式：IMU 输入异常立即停止采样，由主循环报错退出。
                 self.last_error = str(exc)
                 self.last_error_type = type(exc).__name__
                 self.error_count += 1
+                self._running = False
+                return
 
             next_sample_us = ticks_add(next_sample_us, self.sample_period_us)
             remaining_us = ticks_diff(next_sample_us, ticks_us())

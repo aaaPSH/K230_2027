@@ -21,8 +21,10 @@ class ConsoleCommandOutput(OverloadCommandOutput):
 
     def send_overload(self, command):
         print(
-            "cmd detected={} pitch_g={:.3f} yaw_g={:.3f} fps={:.1f}".format(
+            "cmd detected={} predicted={} valid={} pitch_g={:.3f} yaw_g={:.3f} fps={:.1f}".format(
                 command.get("detected", False),
+                command.get("predicted", False),
+                command.get("guidance_valid", False),
                 command.get("pitch_overload_g", 0.0),
                 command.get("yaw_overload_g", 0.0),
                 command.get("fps", 0.0),

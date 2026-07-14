@@ -207,6 +207,13 @@ def step_guidance(
     fps,
     diagnostics=None,
 ):
+    if attitude_worker.last_error is not None:
+        raise RuntimeError(
+            "attitude worker error ({}): {}".format(
+                attitude_worker.last_error_type or "Exception",
+                attitude_worker.last_error,
+            )
+        )
     detector_start_us = ticks_us() if diagnostics is not None else None
     detection = detector.detect(image)
     if diagnostics is not None:
@@ -214,12 +221,26 @@ def step_guidance(
     attitude_state = attitude_worker.state_at(image_timestamp_us)
     roll_rad = None
     gyro_b = None
-    if attitude_state is not None and attitude_state.get("timestamp_match", False):
+    max_source_age_us = int(
+        COMM_CONFIG.get("attitude", {}).get("max_source_age_us", 150000)
+    )
+    attitude_valid = bool(
+        attitude_state is not None
+        and attitude_state.get("timestamp_match", False)
+        and attitude_state.get("initialized", False)
+        and attitude_state.get("source_age_us", max_source_age_us + 1)
+        <= max_source_age_us
+    )
+    if attitude_valid:
         roll_rad = attitude_state.get("roll_rad")
         gyro_b = attitude_state.get("gyro_b")
 
     guidance_start_us = ticks_us() if diagnostics is not None else None
-    if detection.get("detected", False):
+    if not attitude_valid:
+        # 缺少可靠姿态时无法完成滚转分配和惯性 LOS rate 补偿，禁止非零输出。
+        guidance.reset()
+        guidance_result = guidance.lost_result()
+    elif detection.get("detected", False):
         guidance_result = guidance.update(
             detection["x"],
             detection["y"],
@@ -228,8 +249,11 @@ def step_guidance(
             gyro_b=gyro_b,
         )
     else:
-        guidance.predict_kalman(dt)
-        guidance_result = guidance.lost_result()
+        guidance_result = guidance.predict(
+            dt,
+            roll_rad=roll_rad,
+            gyro_b=gyro_b,
+        )
     if diagnostics is not None:
         diagnostics.record_guidance(ticks_diff(ticks_us(), guidance_start_us))
 
@@ -249,12 +273,16 @@ def step_guidance(
         guidance_result["sensor_source_timestamp_us"] = attitude_state.get(
             "source_timestamp_us"
         )
+        guidance_result["sensor_source_age_us"] = attitude_state.get(
+            "source_age_us"
+        )
         guidance_result["sensor_initialized"] = attitude_state.get(
             "initialized", False
         )
         guidance_result["sensor_roll_rad"] = attitude_state.get("roll_rad")
         guidance_result["sensor_gyro_b"] = attitude_state.get("gyro_b")
         guidance_result["sensor_gyro_held"] = attitude_state.get("gyro_held", False)
+    guidance_result["sensor_valid"] = attitude_valid
 
     command = build_overload_command(
         detection,
@@ -303,7 +331,8 @@ def run():
         apply_runtime_camera_settings(sensor, CAMERA_CONFIG)
 
         clock = time.clock()
-        last_frame_ms = get_millis()
+        # 制导滤波器使用微秒时钟，避免毫秒量化在高帧率下放大角速度噪声。
+        last_frame_us = ticks_us()
         channel_id = CAMERA_CONFIG["channel_id"]
         max_dt_sec = GUIDANCE_CONFIG.get("max_dt_sec", 0.2)
         fps = 0.0
@@ -315,9 +344,9 @@ def run():
             os.exitpoint()
             clock.tick()
 
-            now_ms = get_millis()
-            dt = millis_diff(now_ms, last_frame_ms) / 1000.0
-            last_frame_ms = now_ms
+            now_us = ticks_us()
+            dt = ticks_diff(now_us, last_frame_us) / 1000000.0
+            last_frame_us = now_us
             if dt <= 0.0 or dt > max_dt_sec:
                 guidance.reset()
                 dt = 0.0
@@ -392,6 +421,8 @@ def run():
         print("user stop:", exc)
     except Exception as exc:
         print("guidance loop error:", exc)
+        # 排错阶段保留异常栈并中断程序，禁止静默继续控制。
+        raise
     finally:
         if keyframe_saver is not None:
             keyframe_saver.close()
