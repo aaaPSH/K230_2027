@@ -3,6 +3,8 @@ import math
 
 IMU_FRAME_BYTES = 36
 IMU_FLOAT_COUNT = 9
+IMU_DATA_FLOAT_COUNT = 8
+IMU_FRAME_TAIL = b"\x00\x00\x80\x7f"
 
 
 class ImuInterface:
@@ -31,7 +33,7 @@ class SerialImuReader(ImuInterface):
 
     协议固定为 36 字节的小端 IEEE-754 ``float32 * 9``。发送顺序为::
 
-        ax,ay,az,gx,gy,gz,reserved_0,reserved_1,reserved_2
+        ax,ay,az,gx,gy,gz,reserved_0, reserved_1, frame_tail
 
     接收数据先按 ``accel=[ax,ay,az]``、``gyro=[gx,gy,gz]`` 组织，再通过
     可配置装配矩阵转换为制导使用的镖体系 ``accel_b``、``gyro_b``。
@@ -125,7 +127,14 @@ class SerialImuReader(ImuInterface):
     def _parse_binary_frame(self, frame):
         if len(frame) != IMU_FRAME_BYTES:
             raise ValueError("UART binary frame length is invalid")
-        values = _unpack_float32_le(frame, IMU_FLOAT_COUNT)
+        # 帧尾按原始字节校验；00 00 80 7F 作为小端 float32 是 +Inf，不能
+        # 与前八个传感器数据一起执行有限值检查。
+        if frame[IMU_DATA_FLOAT_COUNT * 4:] != IMU_FRAME_TAIL:
+            raise ValueError("UART binary frame tail is invalid")
+        values = _unpack_float32_le(
+            frame[:IMU_DATA_FLOAT_COUNT * 4],
+            IMU_DATA_FLOAT_COUNT,
+        )
         if not all(_is_finite(value) for value in values):
             raise ValueError("UART binary frame contains non-finite float")
         return {
@@ -137,7 +146,7 @@ class SerialImuReader(ImuInterface):
             "gz": values[5],
             "reserved_0": values[6],
             "reserved_1": values[7],
-            "reserved_2": values[8],
+            "frame_tail": IMU_FRAME_TAIL,
         }
 
 

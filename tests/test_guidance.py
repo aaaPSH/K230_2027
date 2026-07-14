@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(ROOT, "src", "dart_py"))
 from attitude import AttitudeWorker
 from flight_log import FlightLogger
 from guidance import G, ProportionalGuidance, build_overload_command
-from imu_uart import SerialImuReader
+from imu_uart import IMU_FRAME_TAIL, SerialImuReader
 
 
 def make_guidance(**overrides):
@@ -209,17 +209,26 @@ class GuidanceTest(unittest.TestCase):
 class ImuInputTest(unittest.TestCase):
     def test_non_finite_uart_frame_is_rejected(self):
         reader = SerialImuReader.__new__(SerialImuReader)
-        frame = struct.pack("<9f", float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        frame = struct.pack("<8f", float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) + IMU_FRAME_TAIL
         with self.assertRaises(ValueError):
             reader._parse_binary_frame(frame)
 
     def test_invalid_uart_packet_is_not_silently_dropped_in_debug_mode(self):
         reader = SerialImuReader.__new__(SerialImuReader)
         reader.invalid_packet_count = 0
-        frame = struct.pack("<9f", float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        frame = struct.pack("<8f", float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) + IMU_FRAME_TAIL
         with self.assertRaises(ValueError):
             reader._append_packet(frame)
         self.assertEqual(reader.invalid_packet_count, 1)
+
+    def test_uart_frame_tail_is_checked_as_raw_bytes(self):
+        reader = SerialImuReader.__new__(SerialImuReader)
+        frame = struct.pack("<8f", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0) + IMU_FRAME_TAIL
+        record = reader._parse_binary_frame(frame)
+        self.assertEqual(record["frame_tail"], IMU_FRAME_TAIL)
+        invalid = frame[:-4] + b"\x00\x00\x00\x00"
+        with self.assertRaises(ValueError):
+            reader._parse_binary_frame(invalid)
 
     def test_non_finite_attitude_sample_raises(self):
         class BadImu:
