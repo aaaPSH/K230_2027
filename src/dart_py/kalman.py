@@ -147,6 +147,8 @@ class KalmanFilter:
         _require_square(self.Q, self.state_size, "process_noise")
         _require_square(self.R, self.measurement_size, "measurement_noise")
         if self.B is not None:
+            if not self.B or not self.B[0]:
+                raise ValueError("control_matrix must not be empty")
             _require_shape(self.B, self.state_size, len(self.B[0]), "control_matrix")
 
 

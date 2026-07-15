@@ -10,7 +10,7 @@ CAMERA_CONFIG = {
     "vflip": False,
     "auto_exposure": False,
     "exposure_us": 100,
-    "analog_gain": 0.0,
+    "analog_gain": 5.0,
     # 相机内参矩阵 K。当前数值与原 65°×40° 视场角配置等价，保证迁移前后
     # 制导增益不突变；完成实机标定后应直接替换为标定结果。
     "camera_matrix": [

@@ -5,6 +5,7 @@ IMU_FRAME_BYTES = 36
 IMU_FLOAT_COUNT = 9
 IMU_DATA_FLOAT_COUNT = 8
 IMU_FRAME_TAIL = b"\x00\x00\x80\x7f"
+IMU_PAYLOAD_BYTES = IMU_DATA_FLOAT_COUNT * 4
 
 
 class ImuInterface:
@@ -57,15 +58,23 @@ class SerialImuReader(ImuInterface):
             1,
             int(self.config.get("max_pending_packets", 32)),
         )
+        self.max_consecutive_invalid_frames = max(
+            1,
+            int(self.config.get("max_consecutive_invalid_frames", 20)),
+        )
         self._rx_buffer = bytearray()
         self._pending_packets = []
         self.invalid_packet_count = 0
+        self.consecutive_invalid_count = 0
+        self.imu_fault = False
+        self.last_invalid_error = None
 
     @property
     def pending_packet_count(self):
         return len(self._pending_packets)
 
     def read(self):
+        """由姿态线程调用；读取 UART 并返回一个已解析的最新样本。"""
         self._read_available()
         if not self._pending_packets:
             return None
@@ -86,28 +95,52 @@ class SerialImuReader(ImuInterface):
             data = data.encode()
         self._rx_buffer.extend(data)
 
-        while len(self._rx_buffer) >= IMU_FRAME_BYTES:
-            frame = bytes(self._rx_buffer[:IMU_FRAME_BYTES])
-            self._rx_buffer = self._rx_buffer[IMU_FRAME_BYTES:]
+        # 当前下位机协议没有独立帧头，使用 JustFloat 帧尾进行流式重同步。
+        # 不能按固定 36 字节切片，否则丢一个字节后所有后续帧都会错位。
+        while True:
+            tail_index = self._rx_buffer.find(IMU_FRAME_TAIL)
+            if tail_index < 0:
+                # 保留一个最长候选帧所需的尾部数据，等待下一次 read() 补全。
+                # 只保留帧尾前缀会丢掉已收到的半帧有效载荷。
+                keep_bytes = IMU_PAYLOAD_BYTES + len(IMU_FRAME_TAIL) - 1
+                if len(self._rx_buffer) > keep_bytes:
+                    self._rx_buffer = self._rx_buffer[-keep_bytes:]
+                return
+
+            if tail_index < IMU_PAYLOAD_BYTES:
+                # 帧尾前没有足够的 32 字节数据，丢弃这段不完整/乱码并继续找。
+                del self._rx_buffer[:tail_index + len(IMU_FRAME_TAIL)]
+                continue
+
+            frame_end = tail_index + len(IMU_FRAME_TAIL)
+            frame = bytes(self._rx_buffer[tail_index - IMU_PAYLOAD_BYTES:frame_end])
+            del self._rx_buffer[:frame_end]
             self._append_packet(frame)
 
     def _append_packet(self, frame):
         try:
             packet = self._parse_packet(frame)
         except (TypeError, ValueError, IndexError) as exc:
-            self.invalid_packet_count += 1
-            # 排错阶段禁止吞掉坏帧：后台姿态线程会将该异常上报主循环并中断。
-            raise ValueError("invalid UART IMU frame #{}: {}".format(
-                self.invalid_packet_count,
-                exc,
-            ))
+            self._record_invalid_frame(exc)
+            return
         if packet is None:
-            self.invalid_packet_count += 1
-            raise ValueError("UART IMU parser returned an empty packet")
+            self._record_invalid_frame(ValueError("parser returned an empty packet"))
+            return
+        self.consecutive_invalid_count = 0
+        self.imu_fault = False
+        self.last_invalid_error = None
         self._pending_packets.append(packet)
         if len(self._pending_packets) > self.max_pending_packets:
             # 保留最新样本，防止图像匹配滞后。
             del self._pending_packets[0]
+
+    def _record_invalid_frame(self, error):
+        """记录坏帧并保留运行；连续异常达到阈值时标记 IMU 失效。"""
+        self.invalid_packet_count += 1
+        self.consecutive_invalid_count += 1
+        self.last_invalid_error = str(error)
+        if self.consecutive_invalid_count >= self.max_consecutive_invalid_frames:
+            self.imu_fault = True
 
     def _parse_packet(self, frame):
         record = self._parse_binary_frame(frame)

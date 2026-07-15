@@ -8,6 +8,14 @@ COMM_CONFIG = {
     "debug_print": True,
     # 仅在需要逐帧查看下发指令时启用；通常应保持关闭。
     "command_debug_print": False,
+    "command": {
+        "enabled": True,
+        "uart_id": "UART1",
+        "tx_pin": 3,
+        "rx_pin": 4,
+        "baudrate": 115200,
+        # 下发帧：5A A5 + IMU 坐标系 ny(float32) + nz(float32) + 累加校验和。
+    },
     "diagnostics": {
         # debug_print 控制是否启用；此处仅配置输出周期。
         "enabled": False,
@@ -49,6 +57,8 @@ COMM_CONFIG = {
         # 固定帧：36 字节，小端 IEEE-754 float32，共 9 个值。
         # 前 6 个值为 ax,ay,az,gx,gy,gz，第 7、8 个值保留，第 9 个值为
         # 小端 float32 帧尾字节 00 00 80 7F。
+        # 连续达到该数量的坏帧才标记 IMU 失效，单帧错误不会停止姿态线程。
+        "max_consecutive_invalid_frames": 20,
         "accel_to_body": [
             [0.0, 1.0, 0.0],
             [1.0, 0.0, 0.0],

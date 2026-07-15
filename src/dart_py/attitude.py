@@ -325,7 +325,7 @@ class AttitudeWorker:
                 self.sample_once()
                 self.last_error = None
             except Exception as exc:
-                # 当前处于排错模式：IMU 输入异常立即停止采样，由主循环报错退出。
+                # 解析器会吞掉单帧坏数据；这里仅处理真正的线程/接口异常。
                 self.last_error = str(exc)
                 self.last_error_type = type(exc).__name__
                 self.error_count += 1
