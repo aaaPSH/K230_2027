@@ -10,6 +10,7 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "src", "dart_py"))
 
 from attitude import AttitudeWorker
+from command_output import SerialCommandOutput, pack_command_frame
 from flight_log import FlightLogger
 from guidance import G, ProportionalGuidance, build_overload_command
 from imu_uart import IMU_FRAME_TAIL, SerialImuReader
@@ -46,6 +47,26 @@ class GuidanceTest(unittest.TestCase):
         result = guidance.update(160.0, 120.0, dt=0.02)
         self.assertAlmostEqual(result["yaw_overload_g"], 0.0, places=7)
         self.assertAlmostEqual(result["pitch_overload_g"], 0.0, places=7)
+
+    def test_body_overload_signs_match_dart_axes(self):
+        guidance = make_guidance(use_kalman_filter=False)
+
+        guidance.update(160.0, 150.0, dt=0.1)
+        upward = guidance.update(160.0, 140.0, dt=0.1)
+        self.assertLess(upward["pitch_overload_g"], 0.0)
+        self.assertLess(upward["body_z_overload_g"], 0.0)
+
+        guidance.reset()
+        guidance.update(160.0, 90.0, dt=0.1)
+        downward = guidance.update(160.0, 100.0, dt=0.1)
+        self.assertGreater(downward["pitch_overload_g"], 0.0)
+        self.assertGreater(downward["body_z_overload_g"], 0.0)
+
+        guidance.reset()
+        guidance.update(180.0, 120.0, dt=0.1)
+        rightward = guidance.update(190.0, 120.0, dt=0.1)
+        self.assertGreater(rightward["yaw_overload_g"], 0.0)
+        self.assertGreater(rightward["body_y_overload_g"], 0.0)
 
     def test_kalman_uses_angle_measurement_only(self):
         guidance = make_guidance()
@@ -186,17 +207,18 @@ class GuidanceTest(unittest.TestCase):
             places=12,
         )
 
-    def test_control_direction_signs_only_accept_unit_values(self):
+    def test_body_overload_command_does_not_apply_output_signs(self):
         with self.assertRaises(ValueError):
             make_guidance(roll_sign=0.0)
         guidance = make_guidance()
         result = guidance.update(guidance.cx, guidance.cy, dt=0.02)
-        with self.assertRaises(ValueError):
-            build_overload_command(
-                {"detected": True, "x": guidance.cx, "y": guidance.cy},
-                result,
-                config={"yaw_output_sign": 0.5, "pitch_output_sign": 1.0},
-            )
+        command = build_overload_command(
+            {"detected": True, "x": guidance.cx, "y": guidance.cy},
+            result,
+            config={"yaw_output_sign": -1.0, "pitch_output_sign": -1.0},
+        )
+        self.assertEqual(command["yaw_overload_g"], result["body_y_overload_g"])
+        self.assertEqual(command["pitch_overload_g"], result["body_z_overload_g"])
 
     def test_large_reacquisition_innovation_reinitializes_filter(self):
         guidance = make_guidance()
@@ -207,19 +229,72 @@ class GuidanceTest(unittest.TestCase):
 
 
 class ImuInputTest(unittest.TestCase):
+    @staticmethod
+    def _make_reader(chunks):
+        class FakeUart:
+            def __init__(self, data_chunks):
+                self.data_chunks = list(data_chunks)
+
+            def read(self):
+                if not self.data_chunks:
+                    return b""
+                return self.data_chunks.pop(0)
+
+        reader = SerialImuReader.__new__(SerialImuReader)
+        reader.uart = FakeUart(chunks)
+        reader.accel_to_body = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        reader.gyro_to_body = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        reader.max_pending_packets = 32
+        reader.max_consecutive_invalid_frames = 3
+        reader._rx_buffer = bytearray()
+        reader._pending_packets = []
+        reader.invalid_packet_count = 0
+        reader.consecutive_invalid_count = 0
+        reader.imu_fault = False
+        reader.last_invalid_error = None
+        return reader
+
+    @staticmethod
+    def _frame(first_value):
+        values = [first_value, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        return struct.pack("<8f", *values) + IMU_FRAME_TAIL
+
     def test_non_finite_uart_frame_is_rejected(self):
         reader = SerialImuReader.__new__(SerialImuReader)
         frame = struct.pack("<8f", float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) + IMU_FRAME_TAIL
         with self.assertRaises(ValueError):
             reader._parse_binary_frame(frame)
 
-    def test_invalid_uart_packet_is_not_silently_dropped_in_debug_mode(self):
-        reader = SerialImuReader.__new__(SerialImuReader)
-        reader.invalid_packet_count = 0
+    def test_invalid_uart_packet_does_not_escape_reader(self):
+        reader = self._make_reader([])
         frame = struct.pack("<8f", float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) + IMU_FRAME_TAIL
-        with self.assertRaises(ValueError):
-            reader._append_packet(frame)
+        reader._append_packet(frame)
         self.assertEqual(reader.invalid_packet_count, 1)
+        self.assertEqual(reader.consecutive_invalid_count, 1)
+        self.assertFalse(reader.imu_fault)
+
+    def test_stream_parser_accepts_split_frame_and_resynchronizes_after_bad_frame(self):
+        bad = struct.pack("<8f", float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) + IMU_FRAME_TAIL
+        good = self._frame(11.0)
+        reader = self._make_reader([b"\x55", bad, good[:13], good[13:]])
+
+        self.assertIsNone(reader.read())
+        self.assertEqual(reader.invalid_packet_count, 0)
+        self.assertIsNone(reader.read())
+        self.assertEqual(reader.invalid_packet_count, 1)
+        self.assertIsNone(reader.read())
+        sample = reader.read()
+        self.assertIsNotNone(sample)
+        self.assertEqual(sample["uart_fields"]["ax"], 11.0)
+        self.assertEqual(reader.consecutive_invalid_count, 0)
+        self.assertFalse(reader.imu_fault)
+
+    def test_many_consecutive_bad_frames_mark_imu_fault_without_raising(self):
+        bad = struct.pack("<8f", float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) + IMU_FRAME_TAIL
+        reader = self._make_reader([bad * 3])
+        self.assertIsNone(reader.read())
+        self.assertEqual(reader.invalid_packet_count, 3)
+        self.assertTrue(reader.imu_fault)
 
     def test_uart_frame_tail_is_checked_as_raw_bytes(self):
         reader = SerialImuReader.__new__(SerialImuReader)
@@ -239,6 +314,69 @@ class ImuInputTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             worker.sample_once(timestamp_us=1)
 
+
+class CommandOutputTest(unittest.TestCase):
+    def test_command_frame_matches_lower_computer_protocol(self):
+        frame = pack_command_frame(1.25, -2.5)
+        expected_without_checksum = b"\x5a\xa5" + struct.pack("<2f", 1.25, -2.5)
+        self.assertEqual(frame[:10], expected_without_checksum)
+        self.assertEqual(len(frame), 11)
+        self.assertEqual(frame[10], sum(frame[:10]) & 0xFF)
+
+    def test_serial_command_output_maps_identity_axes(self):
+        class FakeUart:
+            def __init__(self):
+                self.frames = []
+
+            def write(self, frame):
+                self.frames.append(frame)
+
+        uart = FakeUart()
+        output = SerialCommandOutput(
+            {"lateral_imu_axis": 1, "normal_imu_axis": 2}, uart=uart
+        )
+        output.send_overload(
+            {
+                "guidance_valid": True,
+                "yaw_overload_g": 0.25,
+                "pitch_overload_g": -0.5,
+            }
+        )
+        self.assertEqual(len(uart.frames), 1)
+        self.assertEqual(uart.frames[0], pack_command_frame(0.25, -0.5))
+
+    def test_serial_command_output_converts_body_command_to_imu_axes(self):
+        class FakeUart:
+            def __init__(self):
+                self.frames = []
+
+            def write(self, frame):
+                self.frames.append(frame)
+
+        uart = FakeUart()
+        output = SerialCommandOutput(
+            {
+                # body = [imu_y, imu_x, -imu_z]
+                "imu_to_body": [
+                    [0.0, 1.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 0.0, -1.0],
+                ]
+            },
+            uart=uart,
+        )
+        output.send_overload(
+            {
+                "guidance_valid": True,
+                "yaw_overload_g": 0.25,
+                "pitch_overload_g": -0.5,
+            }
+        )
+        self.assertEqual(uart.frames[0], pack_command_frame(0.25, 0.5))
+
+    def test_invalid_command_value_is_rejected(self):
+        with self.assertRaises(ValueError):
+            pack_command_frame(float("nan"), 0.0)
 
 class FlightLogTest(unittest.TestCase):
     def test_flight_log_row_matches_extended_header(self):

@@ -14,7 +14,10 @@ COMM_CONFIG = {
         "tx_pin": 3,
         "rx_pin": 4,
         "baudrate": 115200,
-        # 下发帧：5A A5 + IMU 坐标系 ny(float32) + nz(float32) + 累加校验和。
+        # 下发帧：5A A5 + IMU 横向轴(float32) + IMU 法向轴(float32) + 累加校验和。
+        # 当前 imu_to_body 为 body=[imu_y, imu_x, -imu_z]，因此使用 IMU x/z。
+        "lateral_imu_axis": 0,
+        "normal_imu_axis": 2,
     },
     "diagnostics": {
         # debug_print 控制是否启用；此处仅配置输出周期。

@@ -310,8 +310,11 @@ class ProportionalGuidance:
         pitch_command_rate = pitch_dot + pitch_angle_control
 
         # 稳定坐标系 PN 指令先转换为 g，再逆滚转分配到弹体系 y/z。
+        # 过载统一定义为实际镖体坐标系分量：+y 向右，+z 向下。
+        # yaw LOS 角为向右为正，因此 yaw PN 项保持正号；pitch LOS 角为抬头为正，
+        # 而镖体 +z 为向下，所以 pitch PN 项需要取负号。
         stable_yaw_g = self.yaw_navigation_ratio * self.yaw_closing_velocity * yaw_command_rate / G
-        stable_pitch_g = self.pitch_navigation_ratio * self.pitch_closing_velocity * pitch_command_rate / G
+        stable_pitch_g = -self.pitch_navigation_ratio * self.pitch_closing_velocity * pitch_command_rate / G
         yaw_overload_g, pitch_overload_g = self._allocate_to_body(stable_yaw_g, stable_pitch_g, roll_rad)
         yaw_overload_g = _limit_overload(yaw_overload_g, self.yaw_max_overload_g)
         pitch_overload_g = _limit_overload(pitch_overload_g, self.pitch_max_overload_g)
@@ -350,6 +353,8 @@ class ProportionalGuidance:
             "stable_pitch_overload_g": stable_pitch_g,
             "yaw_overload_g": yaw_overload_g,
             "pitch_overload_g": pitch_overload_g,
+            "body_y_overload_g": yaw_overload_g,
+            "body_z_overload_g": pitch_overload_g,
         }
 
     def _los_dot_body(self, los_b, dt):
@@ -564,7 +569,7 @@ def make_guidance_from_config(camera_config, guidance_config):
 
 
 def build_overload_command(detection, guidance_result, fps=0.0, dt=0.0, config=None):
-    """构造下位机负载；仅允许有效量测或限时预测结果产生非零指令。"""
+    """构造镖体坐标系过载；仅允许有效量测或限时预测结果产生非零指令。"""
     config = config or {}
     guidance_valid = bool(guidance_result and guidance_result.get("guidance_valid", False))
     raw_detected = bool(detection and detection.get("detected", False))
@@ -573,15 +578,22 @@ def build_overload_command(detection, guidance_result, fps=0.0, dt=0.0, config=N
         return {
             "detected": False, "predicted": False, "guidance_valid": False,
             "pitch_overload_g": 0.0, "yaw_overload_g": 0.0,
+            "body_y_overload_g": 0.0, "body_z_overload_g": 0.0,
             "pitch_los_rate_rad_s": 0.0, "yaw_los_rate_rad_s": 0.0,
             "target_x": -1.0, "target_y": -1.0, "fps": float(fps), "dt": float(dt),
         }
-    pitch_output_sign = _unit_sign(config.get("pitch_output_sign", 1.0), "pitch_output_sign")
-    yaw_output_sign = _unit_sign(config.get("yaw_output_sign", -1.0), "yaw_output_sign")
+    body_y_overload_g = guidance_result.get(
+        "body_y_overload_g", guidance_result.get("yaw_overload_g", 0.0)
+    )
+    body_z_overload_g = guidance_result.get(
+        "body_z_overload_g", guidance_result.get("pitch_overload_g", 0.0)
+    )
     return {
         "detected": raw_detected, "predicted": predicted, "guidance_valid": True,
-        "pitch_overload_g": pitch_output_sign * guidance_result.get("pitch_overload_g", 0.0),
-        "yaw_overload_g": yaw_output_sign * guidance_result.get("yaw_overload_g", 0.0),
+        "pitch_overload_g": body_z_overload_g,
+        "yaw_overload_g": body_y_overload_g,
+        "body_y_overload_g": body_y_overload_g,
+        "body_z_overload_g": body_z_overload_g,
         "pitch_los_rate_rad_s": guidance_result.get("pitch_los_rate_rad_s", 0.0),
         "yaw_los_rate_rad_s": guidance_result.get("yaw_los_rate_rad_s", 0.0),
         "target_x": float(detection.get("x", -1.0)) if raw_detected else -1.0,

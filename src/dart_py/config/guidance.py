@@ -50,8 +50,7 @@ GUIDANCE_CONFIG = {
     "pitch_max_overload_g": 0.5,
     "roll_compensation": True,
     "roll_sign": -1.0,
-    "yaw_output_sign": -1.0,
-    "pitch_output_sign": 1.0,
+    # 过载已经是镖体坐标系分量：+y 向右，+z 向下。
     # 0 表示关闭斜率限制；台架确认执行机构限速后再设为正值。
     "yaw_max_slew_g_s": 0.0,
     "pitch_max_slew_g_s": 0.0,

@@ -53,20 +53,32 @@ class SerialCommandOutput(OverloadCommandOutput):
         self.uart = uart if uart is not None else _initialize_command_uart(self.config)
         imu_to_body = self.config.get("imu_to_body", _identity_matrix())
         self.body_to_imu = _transpose_matrix(imu_to_body)
+        self.lateral_imu_axis = _axis_index(
+            self.config.get("lateral_imu_axis", 0), "lateral_imu_axis"
+        )
+        self.normal_imu_axis = _axis_index(
+            self.config.get("normal_imu_axis", 2), "normal_imu_axis"
+        )
+        if self.lateral_imu_axis == self.normal_imu_axis:
+            raise ValueError("lateral_imu_axis and normal_imu_axis must differ")
 
     def send_overload(self, command):
-        """将 body 指令转换到 IMU 坐标后发送其 ``y/z`` 分量。"""
+        """将镖体过载转换到 IMU 坐标后发送横向/法向两个配置轴。"""
         command = command or {}
         if command.get("guidance_valid", False):
-            body_y = command.get("yaw_overload_g", 0.0)
-            body_z = command.get("pitch_overload_g", 0.0)
+            body_y = command.get(
+                "body_y_overload_g", command.get("yaw_overload_g", 0.0)
+            )
+            body_z = command.get(
+                "body_z_overload_g", command.get("pitch_overload_g", 0.0)
+            )
         else:
             # 无有效制导结果时向下位机发送零指令，避免沿用上一帧指令。
             body_y = 0.0
             body_z = 0.0
         imu_command = _mat_vec_mul(self.body_to_imu, [0.0, body_y, body_z])
-        ny = imu_command[1]
-        nz = imu_command[2]
+        ny = imu_command[self.lateral_imu_axis]
+        nz = imu_command[self.normal_imu_axis]
         frame = pack_command_frame(ny, nz)
         if self.uart is None:
             return False
@@ -120,6 +132,16 @@ def _identity_matrix():
     ]
 
 
+def _axis_index(value, name):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("{} must be 0, 1, or 2".format(name))
+    if value < 0 or value > 2:
+        raise ValueError("{} must be 0, 1, or 2".format(name))
+    return value
+
+
 def _transpose_matrix(matrix):
     if matrix is None or len(matrix) != 3 or any(len(row) != 3 for row in matrix):
         raise ValueError("imu_to_body must be a 3x3 matrix")
@@ -146,4 +168,7 @@ def make_lower_computer_interface(config, uart=None):
         command_config["imu_to_body"] = config.get("imu", {}).get(
             "accel_to_body", _identity_matrix()
         )
+    # 当前默认 body=[imu_y, imu_x, -imu_z]，所以镖体 y/z 过载对应 IMU x/z。
+    command_config.setdefault("lateral_imu_axis", 0)
+    command_config.setdefault("normal_imu_axis", 2)
     return SerialCommandOutput(command_config or config, uart=uart)
