@@ -30,6 +30,18 @@ from visualization import draw_visualization
 
 # GC 不需要每帧执行；45 帧约对应 90 FPS 下每 0.5 秒执行一次。
 GC_COLLECT_INTERVAL_FRAMES = 30
+CONSOLE_CONFIG = COMM_CONFIG.get("console", {})
+
+
+def console_enabled(category):
+    """返回指定功能的控制台调试开关。"""
+    return bool(CONSOLE_CONFIG.get(category, False))
+
+
+def console_print(category, *values):
+    """仅输出指定功能类别的控制台信息。"""
+    if console_enabled(category):
+        print(*values)
 
 
 def get_millis():
@@ -57,7 +69,12 @@ class RuntimeDiagnostics:
 
     def __init__(self, config=None):
         config = config or {}
-        self.enabled = bool(config.get("enabled", False))
+        self.runtime_output = bool(config.get("runtime_output", False))
+        self.telemetry_output = bool(config.get("telemetry_output", False))
+        self.imu_output = bool(config.get("imu_output", False))
+        self.enabled = (
+            self.runtime_output or self.telemetry_output or self.imu_output
+        )
         self.period_ms = max(100, int(config.get("period_ms", 1000)))
         self._last_report_ms = None
         self._frame_count = 0
@@ -69,29 +86,29 @@ class RuntimeDiagnostics:
         self._latest_state = None
 
     def start_frame(self):
-        return ticks_us()
+        return ticks_us() if self.runtime_output else None
 
     def record_frame(self, frame_start_us, gc_us):
-        if not self.enabled:
+        if not self.runtime_output or frame_start_us is None:
             return
         self._frame_count += 1
         self._frame_total_us += ticks_diff(ticks_us(), frame_start_us)
         self._gc_total_us += gc_us
 
     def record_detector(self, elapsed_us):
-        if self.enabled:
+        if self.runtime_output:
             self._detector_total_us += elapsed_us
 
     def record_guidance(self, elapsed_us):
-        if self.enabled:
+        if self.runtime_output:
             self._guidance_total_us += elapsed_us
 
     def start_stage(self):
-        return ticks_us()
+        return ticks_us() if self.runtime_output else None
 
     def record_stage(self, name, stage_start_us):
         """记录一条串行处理链路的耗时，单位为微秒。"""
-        if not self.enabled or stage_start_us is None:
+        if not self.runtime_output or stage_start_us is None:
             return
         elapsed_us = ticks_diff(ticks_us(), stage_start_us)
         self._stage_totals_us[name] = self._stage_totals_us.get(name, 0) + elapsed_us
@@ -106,7 +123,7 @@ class RuntimeDiagnostics:
         command,
     ):
         """保存最近一帧状态，供低频输出与 CSV 使用相同字段。"""
-        if not self.enabled:
+        if not self.telemetry_output and not self.imu_output:
             return
         self._latest_state = (
             frame_index,
@@ -138,82 +155,110 @@ class RuntimeDiagnostics:
             self._last_report_ms = now_ms
             return
 
-        count = max(1, self._frame_count)
-        pending = getattr(imu_interface, "pending_packet_count", 0)
-        invalid = getattr(imu_interface, "invalid_packet_count", 0)
-        error = getattr(attitude_worker, "last_error", None)
-        if fps is None:
-            fps = self._frame_count * 1000.0 / max(1, millis_diff(now_ms, self._last_report_ms))
-        frame_ms = self._frame_total_us / count / 1000.0
-        processing_cap_fps = 1000.0 / max(frame_ms, 0.001)
-        configured_caps = []
-        if camera_fps is not None and camera_fps > 0:
-            configured_caps.append(("camera", float(camera_fps)))
-        if display_enabled and display_fps is not None and display_fps > 0:
-            configured_caps.append(("display", float(display_fps)))
-        configured_cap_fps = (
-            min([value for _, value in configured_caps])
-            if configured_caps
-            else processing_cap_fps
-        )
-        effective_cap_fps = min(processing_cap_fps, configured_cap_fps)
-        stage_averages = {
-            name: total_us / count / 1000.0
-            for name, total_us in self._stage_totals_us.items()
-        }
-        accounted_ms = sum(stage_averages.values())
-        stage_averages["overhead"] = max(0.0, frame_ms - accounted_ms)
-        if stage_averages:
-            bottleneck_name = max(stage_averages, key=stage_averages.get)
-            bottleneck_ms = stage_averages[bottleneck_name]
-        else:
-            bottleneck_name = "none"
-            bottleneck_ms = 0.0
-        if processing_cap_fps <= configured_cap_fps:
-            cap_source = "processing"
-        elif configured_caps:
-            cap_source = min(configured_caps, key=lambda item: item[1])[0]
-        else:
-            cap_source = "processing"
-        print(
-            "diag fps={:.1f} frame_ms={:.2f} detector_ms={:.2f} "
-            "guidance_ms={:.2f} gc_ms={:.2f} imu_pending={} "
-            "imu_invalid={} attitude_error={} cap_fps={:.1f} "
-            "cap_source={} bottleneck={} bottleneck_ms={:.2f}".format(
-                fps,
-                frame_ms,
-                self._detector_total_us / count / 1000.0,
-                self._guidance_total_us / count / 1000.0,
-                self._gc_total_us / count / 1000.0,
-                pending,
-                invalid,
-                error or "none",
-                effective_cap_fps,
-                cap_source,
-                bottleneck_name,
-                bottleneck_ms,
-            )
-        )
-        if stage_averages:
-            stage_text = " ".join(
-                "{}={:.2f}ms".format(name, stage_averages[name])
-                for name in sorted(stage_averages)
-            )
-            print(
-                "diag_stages {} configured_cap_fps={:.1f} "
-                "processing_cap_fps={:.1f}".format(
-                    stage_text,
-                    configured_cap_fps,
-                    processing_cap_fps,
+        if self.runtime_output:
+            count = max(1, self._frame_count)
+            pending = getattr(imu_interface, "pending_packet_count", 0)
+            invalid = getattr(imu_interface, "invalid_packet_count", 0)
+            error = getattr(attitude_worker, "last_error", None)
+            if fps is None:
+                fps = self._frame_count * 1000.0 / max(
+                    1,
+                    millis_diff(now_ms, self._last_report_ms),
                 )
+            frame_ms = self._frame_total_us / count / 1000.0
+            processing_cap_fps = 1000.0 / max(frame_ms, 0.001)
+            configured_caps = []
+            if camera_fps is not None and camera_fps > 0:
+                configured_caps.append(("camera", float(camera_fps)))
+            if display_enabled and display_fps is not None and display_fps > 0:
+                configured_caps.append(("display", float(display_fps)))
+            configured_cap_fps = (
+                min([value for _, value in configured_caps])
+                if configured_caps
+                else processing_cap_fps
             )
-        if self._latest_state is not None:
+            effective_cap_fps = min(processing_cap_fps, configured_cap_fps)
+            stage_averages = {
+                name: total_us / count / 1000.0
+                for name, total_us in self._stage_totals_us.items()
+            }
+            accounted_ms = sum(stage_averages.values())
+            stage_averages["overhead"] = max(0.0, frame_ms - accounted_ms)
+            if stage_averages:
+                bottleneck_name = max(stage_averages, key=stage_averages.get)
+                bottleneck_ms = stage_averages[bottleneck_name]
+            else:
+                bottleneck_name = "none"
+                bottleneck_ms = 0.0
+            if processing_cap_fps <= configured_cap_fps:
+                cap_source = "processing"
+            elif configured_caps:
+                cap_source = min(configured_caps, key=lambda item: item[1])[0]
+            else:
+                cap_source = "processing"
+            console_print(
+                "runtime",
+                "diag fps={:.1f} frame_ms={:.2f} detector_ms={:.2f} "
+                "guidance_ms={:.2f} gc_ms={:.2f} imu_pending={} "
+                "imu_invalid={} attitude_error={} cap_fps={:.1f} "
+                "cap_source={} bottleneck={} bottleneck_ms={:.2f}".format(
+                    fps,
+                    frame_ms,
+                    self._detector_total_us / count / 1000.0,
+                    self._guidance_total_us / count / 1000.0,
+                    self._gc_total_us / count / 1000.0,
+                    pending,
+                    invalid,
+                    error or "none",
+                    effective_cap_fps,
+                    cap_source,
+                    bottleneck_name,
+                    bottleneck_ms,
+                ),
+            )
+            if stage_averages:
+                stage_text = " ".join(
+                    "{}={:.2f}ms".format(name, stage_averages[name])
+                    for name in sorted(stage_averages)
+                )
+                console_print(
+                    "runtime",
+                    "diag_stages {} configured_cap_fps={:.1f} "
+                    "processing_cap_fps={:.1f}".format(
+                        stage_text,
+                        configured_cap_fps,
+                        processing_cap_fps,
+                    ),
+                )
+        if self.telemetry_output and self._latest_state is not None:
             row = FlightLogger.build_row(*self._latest_state)
             telemetry = " ".join(
                 "{}={}".format(FlightLogger.FIELDS[index], row[index])
                 for index in range(len(FlightLogger.FIELDS))
             )
-            print("telemetry " + telemetry)
+            console_print("telemetry", "telemetry " + telemetry)
+        if self.imu_output and self._latest_state is not None:
+            guidance_result = self._latest_state[4] or {}
+            gyro_b = guidance_result.get("sensor_gyro_b") or [None, None, None]
+            console_print(
+                "imu",
+                "imu valid={} initialized={} fault={} held={} roll_rad={} "
+                "gyro_x={} gyro_y={} gyro_z={} source_age_us={} "
+                "match_error_us={} pending={} invalid={}".format(
+                    bool(guidance_result.get("sensor_valid", False)),
+                    bool(guidance_result.get("sensor_initialized", False)),
+                    bool(guidance_result.get("sensor_imu_fault", False)),
+                    bool(guidance_result.get("sensor_gyro_held", False)),
+                    guidance_result.get("sensor_roll_rad"),
+                    gyro_b[0],
+                    gyro_b[1],
+                    gyro_b[2],
+                    guidance_result.get("sensor_source_age_us"),
+                    guidance_result.get("sensor_timestamp_error_us"),
+                    getattr(imu_interface, "pending_packet_count", 0),
+                    getattr(imu_interface, "invalid_packet_count", 0),
+                ),
+            )
         self._last_report_ms = now_ms
         self._frame_count = 0
         self._frame_total_us = 0
@@ -284,9 +329,9 @@ def step_guidance(
                 attitude_worker.last_error,
             )
         )
-    detector_start_us = ticks_us() if diagnostics is not None else None
+    detector_start_us = diagnostics.start_stage() if diagnostics is not None else None
     detection = detector.detect(image)
-    if diagnostics is not None:
+    if diagnostics is not None and detector_start_us is not None:
         diagnostics.record_detector(ticks_diff(ticks_us(), detector_start_us))
     attitude_state = attitude_worker.state_at(image_timestamp_us)
     roll_rad = None
@@ -305,7 +350,7 @@ def step_guidance(
         roll_rad = attitude_state.get("roll_rad")
         gyro_b = attitude_state.get("gyro_b")
 
-    guidance_start_us = ticks_us() if diagnostics is not None else None
+    guidance_start_us = diagnostics.start_stage() if diagnostics is not None else None
     if not attitude_valid:
         # 缺少可靠姿态时无法完成滚转分配和惯性 LOS rate 补偿，禁止非零输出。
         guidance.reset()
@@ -324,7 +369,7 @@ def step_guidance(
             roll_rad=roll_rad,
             gyro_b=gyro_b,
         )
-    if diagnostics is not None:
+    if diagnostics is not None and guidance_start_us is not None:
         diagnostics.record_guidance(ticks_diff(ticks_us(), guidance_start_us))
 
     # 将时间对齐诊断信息附加到引导输出中。
@@ -352,6 +397,15 @@ def step_guidance(
         guidance_result["sensor_roll_rad"] = attitude_state.get("roll_rad")
         guidance_result["sensor_gyro_b"] = attitude_state.get("gyro_b")
         guidance_result["sensor_gyro_held"] = attitude_state.get("gyro_held", False)
+    imu_reader = getattr(attitude_worker, "imu_interface", None)
+    guidance_result["sensor_imu_fault"] = bool(
+        getattr(imu_reader, "imu_fault", False)
+    )
+    guidance_result["sensor_imu_invalid_packet_count"] = getattr(
+        imu_reader,
+        "invalid_packet_count",
+        0,
+    )
     guidance_result["sensor_valid"] = attitude_valid
 
     command = build_overload_command(
@@ -376,11 +430,17 @@ def run():
     flight_logger = None
     keyframe_saver = None
     diagnostics_config = COMM_CONFIG.get("diagnostics", {}).copy()
-    diagnostics_config["enabled"] = bool(COMM_CONFIG.get("debug_print", False))
+    diagnostics_config["runtime_output"] = console_enabled("runtime")
+    diagnostics_config["telemetry_output"] = console_enabled("telemetry")
+    diagnostics_config["imu_output"] = console_enabled("imu")
     diagnostics = RuntimeDiagnostics(diagnostics_config)
     try:
-        flight_logger = FlightLogger(COMM_CONFIG.get("flight_log", {}))
-        keyframe_saver = KeyframeSaver(COMM_CONFIG.get("keyframe", {}))
+        flight_log_config = COMM_CONFIG.get("flight_log", {}).copy()
+        flight_log_config["console_output"] = console_enabled("flight_log")
+        flight_logger = FlightLogger(flight_log_config)
+        keyframe_config = COMM_CONFIG.get("keyframe", {}).copy()
+        keyframe_config["debug_print"] = console_enabled("keyframe")
+        keyframe_saver = KeyframeSaver(keyframe_config)
         detector = Detector(**DETECTOR_CONFIG)
         guidance = make_guidance_from_config(CAMERA_CONFIG, GUIDANCE_CONFIG)
         imu_interface = make_imu_interface(COMM_CONFIG)
@@ -397,7 +457,8 @@ def run():
 
         sensor = create_sensor(CAMERA_CONFIG)
         init_display(DISPLAY_CONFIG)
-        display_inited = DISPLAY_CONFIG.get("enabled", True)
+        display_enabled = bool(DISPLAY_CONFIG.get("enabled", True))
+        display_inited = display_enabled
         MediaManager.init()
         media_inited = True
         sensor.run()
@@ -455,25 +516,30 @@ def run():
             diagnostics.record_stage("guidance_loop", stage_start_us)
 
             stage_start_us = diagnostics.start_stage()
-            draw_visualization(
-                image,
-                detection,
-                command,
-                guidance_result=guidance_result,
-                config=DISPLAY_CONFIG,
-            )
-            diagnostics.record_stage("visualization", stage_start_us)
-
-            stage_start_us = diagnostics.start_stage()
-            keyframe_saver.save_if_needed(
-                image,
+            keyframe_reservation = keyframe_saver.reserve_if_needed(
                 frame_index,
                 image_timestamp_us,
             )
             diagnostics.record_stage("keyframe", stage_start_us)
 
             stage_start_us = diagnostics.start_stage()
-            if DISPLAY_CONFIG.get("enabled", True):
+            if display_enabled or keyframe_reservation is not None:
+                # 无显示且当前帧不保存时，不做绘图和文本格式化。
+                draw_visualization(
+                    image,
+                    detection,
+                    command,
+                    guidance_result=guidance_result,
+                    config=DISPLAY_CONFIG,
+                )
+            diagnostics.record_stage("visualization", stage_start_us)
+
+            stage_start_us = diagnostics.start_stage()
+            keyframe_saver.save_reserved(image, keyframe_reservation)
+            diagnostics.record_stage("keyframe", stage_start_us)
+
+            stage_start_us = diagnostics.start_stage()
+            if display_enabled:
                 Display.show_image(image)
             diagnostics.record_stage("display", stage_start_us)
 
@@ -513,15 +579,22 @@ def run():
                 fps,
                 camera_fps=CAMERA_CONFIG.get("fps"),
                 display_fps=DISPLAY_CONFIG.get("fps"),
-                display_enabled=DISPLAY_CONFIG.get("enabled", True),
+                display_enabled=display_enabled,
             )
     except KeyboardInterrupt as exc:
-        print("user stop:", exc)
+        console_print("errors", "user stop:", exc)
     except Exception as exc:
-        print("guidance loop error:", exc)
+        console_print("errors", "guidance loop error:", exc)
         # 排错阶段保留异常栈并中断程序，禁止静默继续控制。
         raise
     finally:
+        # 无论正常退出还是异常退出，都先发送零过载，再清理共享 UART 和其他资源。
+        # 该操作采用尽力而为策略；即使串口本身已故障，也不能阻止后续资源释放。
+        if lower_interface is not None:
+            try:
+                lower_interface.send_overload({"guidance_valid": False})
+            except Exception as exc:
+                console_print("errors", "failed to send final zero overload:", exc)
         if keyframe_saver is not None:
             keyframe_saver.close()
         if flight_logger is not None:
@@ -545,4 +618,12 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    if console_enabled("errors"):
+        run()
+    else:
+        # 静默运行时禁止未处理异常向控制台输出 traceback；run() 的 finally
+        # 仍会优先发送零过载并完成资源清理。
+        try:
+            run()
+        except Exception:
+            pass

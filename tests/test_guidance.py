@@ -1,5 +1,7 @@
 """制导律关键坐标、滤波与丢失目标行为回归测试。"""
 import math
+import contextlib
+import io
 import os
 import struct
 import sys
@@ -9,11 +11,17 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "src", "dart_py"))
 
+import attitude as attitude_module
 from attitude import AttitudeWorker
-from command_output import SerialCommandOutput, pack_command_frame
+from command_output import (
+    SerialCommandOutput,
+    make_lower_computer_interface,
+    pack_command_frame,
+)
 from flight_log import FlightLogger
 from guidance import G, ProportionalGuidance, build_overload_command
 from imu_uart import IMU_FRAME_TAIL, SerialImuReader
+from keyframe import KeyframeSaver
 
 
 def make_guidance(**overrides):
@@ -73,6 +81,51 @@ class GuidanceTest(unittest.TestCase):
         guidance.update(160.0, 120.0, dt=0.02)
         self.assertEqual(guidance.yaw_filter.measurement_size, 1)
         self.assertEqual(guidance.pitch_filter.measurement_size, 1)
+
+    def test_two_frames_initialize_los_rate_without_slow_convergence(self):
+        guidance = make_guidance()
+        dt = 0.02
+        expected_rate = 1.0
+        guidance.update(guidance.cx, guidance.cy, dt=dt)
+        result = guidance.update(
+            guidance.cx + guidance.fx * math.tan(expected_rate * dt),
+            guidance.cy,
+            dt=dt,
+        )
+
+        self.assertAlmostEqual(
+            result["yaw_los_rate_rad_s"],
+            expected_rate,
+            places=3,
+        )
+        self.assertEqual(result["yaw_kalman_mode"], "rate_initialized")
+        self.assertTrue(result["yaw_kalman_rate_initialized"])
+
+        updated = guidance.update(
+            guidance.cx + guidance.fx * math.tan(2.0 * expected_rate * dt),
+            guidance.cy,
+            dt=dt,
+        )
+        self.assertEqual(updated["yaw_kalman_mode"], "updated")
+        self.assertIsNotNone(updated["yaw_kalman_innovation_residual_rad"])
+        self.assertIsNotNone(updated["yaw_kalman_innovation_nis"])
+        self.assertGreater(updated["yaw_kalman_covariance_rate_rad2_s2"], 0.0)
+
+    def test_unrealistic_two_frame_rate_is_not_used_for_initialization(self):
+        guidance = make_guidance()
+        guidance.update(guidance.cx, guidance.cy, dt=0.02)
+        result = guidance.update(
+            guidance.cx + guidance.fx * 0.5,
+            guidance.cy,
+            dt=0.02,
+        )
+
+        self.assertTrue(result["filter_reinitialized"])
+        self.assertAlmostEqual(
+            guidance.yaw_filter.state()[1],
+            0.0,
+            places=7,
+        )
 
     def test_body_yaw_is_removed_from_inertial_los_rate(self):
         guidance = make_guidance(roll_compensation=False)
@@ -223,9 +276,24 @@ class GuidanceTest(unittest.TestCase):
     def test_large_reacquisition_innovation_reinitializes_filter(self):
         guidance = make_guidance()
         guidance.update(guidance.cx, guidance.cy, dt=0.02)
-        result = guidance.update(guidance.cx + guidance.fx * 0.5, guidance.cy, dt=0.02)
+        guidance.update(
+            guidance.cx + guidance.fx * math.tan(0.02),
+            guidance.cy,
+            dt=0.02,
+        )
+        rate_before_jump = guidance.yaw_filter.state()[1]
+        result = guidance.update(
+            guidance.cx + guidance.fx * 0.5,
+            guidance.cy,
+            dt=0.02,
+        )
         self.assertTrue(result["filter_reinitialized"])
-        self.assertAlmostEqual(guidance.yaw_filter.state()[1], 0.0, places=7)
+        self.assertGreater(abs(rate_before_jump), 0.5)
+        self.assertAlmostEqual(
+            guidance.yaw_filter.state()[1],
+            rate_before_jump,
+            places=7,
+        )
 
 
 class ImuInputTest(unittest.TestCase):
@@ -314,6 +382,39 @@ class ImuInputTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             worker.sample_once(timestamp_us=1)
 
+    def test_attitude_lookup_stops_after_nearest_timestamp(self):
+        worker = AttitudeWorker(None, {"history_size": 8})
+        for timestamp_us in (100, 200, 300, 400):
+            worker._append_history(
+                {
+                    "timestamp_us": timestamp_us,
+                    "source_timestamp_us": timestamp_us,
+                    "roll_rad": 0.0,
+                    "gyro_b": [0.0, 0.0, 0.0],
+                    "accel_b": [0.0, 0.0, 9.8],
+                    "initialized": True,
+                    "gyro_held": False,
+                    "source_age_us": 0,
+                }
+            )
+
+        original_ticks_diff = attitude_module.ticks_diff
+        call_count = [0]
+
+        def counting_ticks_diff(newer, older):
+            call_count[0] += 1
+            return original_ticks_diff(newer, older)
+
+        attitude_module.ticks_diff = counting_ticks_diff
+        try:
+            result = worker.state_at(330)
+        finally:
+            attitude_module.ticks_diff = original_ticks_diff
+
+        self.assertEqual(result["timestamp_us"], 300)
+        # 依次检查 400、300、200 后，后续样本只会离图像时刻更远。
+        self.assertEqual(call_count[0], 3)
+
 
 class CommandOutputTest(unittest.TestCase):
     def test_command_frame_matches_lower_computer_protocol(self):
@@ -378,6 +479,104 @@ class CommandOutputTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             pack_command_frame(float("nan"), 0.0)
 
+    def test_invalid_guidance_sends_zero_overload(self):
+        class FakeUart:
+            def __init__(self):
+                self.frames = []
+
+            def write(self, frame):
+                self.frames.append(frame)
+
+        uart = FakeUart()
+        output = SerialCommandOutput(
+            {"lateral_imu_axis": 1, "normal_imu_axis": 2}, uart=uart
+        )
+        output.send_overload({"guidance_valid": False})
+        self.assertEqual(uart.frames, [pack_command_frame(0.0, 0.0)])
+
+    def test_command_debug_keeps_real_uart_output_enabled(self):
+        class FakeUart:
+            def __init__(self):
+                self.frames = []
+
+            def write(self, frame):
+                self.frames.append(frame)
+
+        uart = FakeUart()
+        output = make_lower_computer_interface(
+            {
+                "console": {"command": True},
+                "command": {
+                    "enabled": True,
+                    "lateral_imu_axis": 1,
+                    "normal_imu_axis": 2,
+                },
+                "imu": {},
+            },
+            uart=uart,
+        )
+        command = {
+            "guidance_valid": True,
+            "yaw_overload_g": 0.25,
+            "pitch_overload_g": -0.5,
+        }
+        console = io.StringIO()
+        with contextlib.redirect_stdout(console):
+            output.send_overload(command)
+
+        self.assertEqual(uart.frames, [pack_command_frame(0.25, -0.5)])
+        self.assertIn("yaw_g=0.250", console.getvalue())
+
+
+class KeyframeSaverTest(unittest.TestCase):
+    class FakeImage:
+        def __init__(self):
+            self.copy_count = 0
+
+        def copy(self):
+            self.copy_count += 1
+            return self
+
+    def test_full_queue_drops_frame_without_raising(self):
+        saver = KeyframeSaver({"enabled": False})
+        saver.enabled = True
+        saver.interval_frames = 1
+        saver.max_pending_frames = 1
+        saver._pending_frames.append((self.FakeImage(), "existing.jpg"))
+
+        image = self.FakeImage()
+        result = saver.save_if_needed(image, 1, 123)
+
+        self.assertIsNone(result)
+        self.assertEqual(image.copy_count, 0)
+        self.assertEqual(saver.dropped_frame_count, 1)
+        self.assertEqual(len(saver._pending_frames), 1)
+
+    def test_reserved_keyframe_is_copied_and_queued_once(self):
+        saver = KeyframeSaver({"enabled": False})
+        saver.enabled = True
+        saver.interval_frames = 1
+        image = self.FakeImage()
+
+        reservation = saver.reserve_if_needed(1, 123)
+        result = saver.save_reserved(image, reservation)
+
+        self.assertEqual(result, reservation)
+        self.assertEqual(image.copy_count, 1)
+        self.assertEqual(saver._reserved_frame_count, 0)
+        self.assertEqual(len(saver._pending_frames), 1)
+
+    def test_writer_error_disables_saver_without_raising(self):
+        saver = KeyframeSaver({"enabled": False})
+        saver.enabled = True
+        saver.interval_frames = 1
+        saver._write_error = "disk failure"
+
+        result = saver.save_if_needed(self.FakeImage(), 1, 123)
+
+        self.assertIsNone(result)
+        self.assertFalse(saver.enabled)
+
 class FlightLogTest(unittest.TestCase):
     def test_flight_log_row_matches_extended_header(self):
         row = FlightLogger.build_row(
@@ -389,6 +588,96 @@ class FlightLogTest(unittest.TestCase):
             {"detected": False},
         )
         self.assertEqual(len(row), len(FlightLogger.FIELDS))
+        self.assertEqual(len(row), 54)
+
+    def test_flight_log_records_detector_and_kalman_diagnostics(self):
+        guidance = make_guidance()
+        guidance.update(guidance.cx, guidance.cy, dt=0.02)
+        result = guidance.update(
+            guidance.cx + guidance.fx * math.tan(0.02),
+            guidance.cy,
+            dt=0.02,
+        )
+        result.update(
+            {
+                "sensor_source_timestamp_us": 900,
+                "sensor_source_age_us": 100,
+                "sensor_imu_fault": False,
+            }
+        )
+        row = FlightLogger.build_row(
+            1,
+            1000,
+            90.0,
+            {
+                "detected": True,
+                "x": 10.0,
+                "y": 20.0,
+                "area": 30.0,
+                "circularity": 0.8,
+                "bbox": (1, 2, 3, 4),
+            },
+            result,
+            {
+                "dt": 0.02,
+                "guidance_valid": True,
+                "yaw_overload_g": 0.25,
+                "pitch_overload_g": -0.5,
+            },
+        )
+        values = dict(zip(FlightLogger.FIELDS, row))
+
+        self.assertEqual(values["dt_s"], "0.020000")
+        self.assertEqual(values["target_circularity"], "0.800000")
+        self.assertEqual(values["imu_source_age_us"], "100")
+        self.assertEqual(values["yaw_kalman_mode"], "rate_initialized")
+        self.assertEqual(values["yaw_kalman_rate_initialized"], "1")
+        self.assertNotEqual(values["yaw_kalman_covariance_rate_rad2_s2"], "")
+        self.assertEqual(values["command_yaw_overload_g"], "0.250000")
+        self.assertEqual(values["command_pitch_overload_g"], "-0.500000")
+
+    def test_flight_log_backpressure_drops_rows_without_raising(self):
+        logger = FlightLogger({"enabled": False})
+        logger.enabled = True
+        logger.max_pending_buffers = 1
+        logger._pending_buffers.append(["existing"])
+        logger._active_buffer = ["new-1", "new-2"]
+
+        logger.flush()
+
+        self.assertEqual(logger.dropped_row_count, 2)
+        self.assertEqual(logger._active_buffer, [])
+        self.assertEqual(len(logger._pending_buffers), 1)
+
+    def test_flight_log_writer_error_disables_logging_without_raising(self):
+        logger = FlightLogger({"enabled": False})
+        logger.enabled = True
+        logger._write_error = "disk failure"
+
+        logger.record(1, 2, 90.0, {}, {}, {})
+
+        self.assertFalse(logger.enabled)
+
+    def test_flight_log_record_queues_unformatted_snapshot(self):
+        logger = FlightLogger({"enabled": False})
+        logger.enabled = True
+        logger.flush_interval_frames = 60
+
+        logger.record(
+            1,
+            2,
+            90.0,
+            {"detected": True, "x": 10.0},
+            {"yaw_kalman_mode": "updated"},
+            {"dt": 0.02},
+        )
+
+        snapshot = logger._active_buffer[0]
+        self.assertIsInstance(snapshot, tuple)
+        self.assertEqual(len(snapshot), len(FlightLogger.FIELDS))
+        self.assertEqual(snapshot[0], 1)
+        self.assertEqual(snapshot[2], 0.02)
+        self.assertEqual(snapshot[28], "updated")
 
 
 if __name__ == "__main__":

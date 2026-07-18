@@ -295,9 +295,18 @@ class AttitudeWorker:
                 sample = self._history[index]
                 if sample is not None:
                     delta_us = ticks_diff(sample["timestamp_us"], image_timestamp_us)
-                    if best_delta_us is None or abs(delta_us) < abs(best_delta_us):
+                    absolute_delta_us = abs(delta_us)
+                    if (
+                        best_delta_us is None
+                        or absolute_delta_us < abs(best_delta_us)
+                    ):
                         best_sample = sample
                         best_delta_us = delta_us
+                    elif absolute_delta_us > abs(best_delta_us):
+                        # 历史记录按新到旧遍历，时间戳也是单调变旧的。
+                        # 一旦越过最近点，后续样本只会离图像时刻更远，
+                        # 无需继续扫描整个环形缓冲区。
+                        break
                 index = (index - 1) % self.history_size
         finally:
             self._lock.release()

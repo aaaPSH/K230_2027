@@ -41,10 +41,10 @@ class ProportionalGuidance:
         kalman=None,
         yaw_kalman=None,
         pitch_kalman=None,
-        kalman_angle_variance=0.05,
-        kalman_rate_variance=1.0,
+        kalman_angle_variance=0.0001,
+        kalman_rate_variance=10.0,
         kalman_process_angle_variance=0.0001,
-        kalman_process_rate_variance=0.02,
+        kalman_process_rate_variance=0.2,
         kalman_measurement_angle_variance=0.0025,
         kalman_measurement_rate_variance=0.1,
         max_overload_g=0.5,
@@ -105,7 +105,8 @@ class ProportionalGuidance:
             # 保留旧参数名兼容；新的过程噪声是白加速度谱密度。
             "process_accel_variance": kalman_process_rate_variance,
             "measurement_angle_variance": kalman_measurement_angle_variance,
-            "innovation_gate_sigma": 3.0,
+            "innovation_gate_sigma": 4.0,
+            "max_initial_rate_rad_s": 10.0,
             "measurement_rate_variance": kalman_measurement_rate_variance,
             "process_angle_variance": kalman_process_angle_variance,
             "process_rate_variance": kalman_process_rate_variance,
@@ -124,6 +125,11 @@ class ProportionalGuidance:
         self.has_filtered_rate = False
         self.yaw_filter = None
         self.pitch_filter = None
+        self._axis_rate_initialized = {
+            "yaw_filter": False,
+            "pitch_filter": False,
+        }
+        self._kalman_diagnostics = {}
         self._last_roll_rad = 0.0
         self._last_yaw_overload_g = None
         self._last_pitch_overload_g = None
@@ -138,6 +144,9 @@ class ProportionalGuidance:
         self.has_filtered_rate = False
         self.yaw_filter = None
         self.pitch_filter = None
+        self._axis_rate_initialized["yaw_filter"] = False
+        self._axis_rate_initialized["pitch_filter"] = False
+        self._kalman_diagnostics = {}
         self._last_yaw_overload_g = None
         self._last_pitch_overload_g = None
         self._prediction_age_s = 0.0
@@ -184,6 +193,24 @@ class ProportionalGuidance:
             dt,
             self.pitch_kalman,
             gyro_pitch_dot,
+        )
+        self._record_axis_diagnostic(
+            "yaw_filter",
+            "predicted",
+            yaw_angle,
+            yaw_dot,
+            self.yaw_filter.covariance(),
+            predicted_angle=yaw_angle,
+            predicted_rate=yaw_dot,
+        )
+        self._record_axis_diagnostic(
+            "pitch_filter",
+            "predicted",
+            pitch_angle,
+            pitch_dot,
+            self.pitch_filter.covariance(),
+            predicted_angle=pitch_angle,
+            predicted_rate=pitch_dot,
         )
         los_s = self._los_from_angles(yaw_angle, pitch_angle)
         relative_yaw_dot = yaw_dot - gyro_yaw_dot
@@ -261,10 +288,8 @@ class ProportionalGuidance:
             dt,
             gyro_yaw_dot,
             gyro_pitch_dot,
+            relative_rate_valid,
         )
-        if filter_reinitialized:
-            gyro_yaw_dot = 0.0
-            gyro_pitch_dot = 0.0
         relative_yaw_dot = yaw_dot - gyro_yaw_dot
         relative_pitch_dot = pitch_dot - gyro_pitch_dot
         return self._build_result(
@@ -320,7 +345,7 @@ class ProportionalGuidance:
         pitch_overload_g = _limit_overload(pitch_overload_g, self.pitch_max_overload_g)
         yaw_overload_g, pitch_overload_g = self._apply_slew_limit(yaw_overload_g, pitch_overload_g, dt)
 
-        return {
+        result = {
             "detected": bool(detected),
             "predicted": bool(predicted),
             "guidance_valid": True,
@@ -356,6 +381,41 @@ class ProportionalGuidance:
             "body_y_overload_g": yaw_overload_g,
             "body_z_overload_g": pitch_overload_g,
         }
+        for attr_name, prefix in (
+            ("yaw_filter", "yaw_kalman"),
+            ("pitch_filter", "pitch_kalman"),
+        ):
+            diagnostic = self._kalman_diagnostics.get(attr_name, {})
+            result[prefix + "_mode"] = diagnostic.get("mode")
+            result[prefix + "_rate_initialized"] = diagnostic.get(
+                "rate_initialized",
+                False,
+            )
+            result[prefix + "_predicted_angle_rad"] = diagnostic.get(
+                "predicted_angle_rad"
+            )
+            result[prefix + "_predicted_rate_rad_s"] = diagnostic.get(
+                "predicted_rate_rad_s"
+            )
+            result[prefix + "_innovation_residual_rad"] = diagnostic.get(
+                "innovation_residual_rad"
+            )
+            result[prefix + "_innovation_variance_rad2"] = diagnostic.get(
+                "innovation_variance_rad2"
+            )
+            result[prefix + "_innovation_nis"] = diagnostic.get(
+                "innovation_nis"
+            )
+            result[prefix + "_covariance_angle_rad2"] = diagnostic.get(
+                "covariance_angle_rad2"
+            )
+            result[prefix + "_covariance_angle_rate"] = diagnostic.get(
+                "covariance_angle_rate"
+            )
+            result[prefix + "_covariance_rate_rad2_s2"] = diagnostic.get(
+                "covariance_rate_rad2_s2"
+            )
+        return result
 
     def _los_dot_body(self, los_b, dt):
         if self.last_los_b is None or dt <= 0.0:
@@ -438,8 +498,10 @@ class ProportionalGuidance:
         dt,
         gyro_yaw_dot=0.0,
         gyro_pitch_dot=0.0,
+        relative_rate_valid=False,
     ):
         if not self.use_kalman_filter:
+            self._kalman_diagnostics = {}
             yaw_dot, pitch_dot = self._filter_los_rates(yaw_dot, pitch_dot)
             return (
                 yaw_angle,
@@ -454,6 +516,7 @@ class ProportionalGuidance:
             dt,
             self.yaw_kalman,
             gyro_yaw_dot,
+            yaw_dot + gyro_yaw_dot if relative_rate_valid else None,
         )
         pitch_angle, pitch_dot, pitch_reset = self._update_axis_filter(
             "pitch_filter",
@@ -461,28 +524,147 @@ class ProportionalGuidance:
             dt,
             self.pitch_kalman,
             gyro_pitch_dot,
+            pitch_dot + gyro_pitch_dot if relative_rate_valid else None,
         )
         return yaw_angle, yaw_dot, pitch_angle, pitch_dot, yaw_reset or pitch_reset
 
-    def _update_axis_filter(self, attr_name, angle, dt, params, gyro_rate_correction):
+    def _update_axis_filter(
+        self,
+        attr_name,
+        angle,
+        dt,
+        params,
+        gyro_rate_correction,
+        measured_rate=None,
+    ):
         axis_filter = getattr(self, attr_name)
+        measurement_variance = _positive_value(
+            params.get("measurement_angle_variance"),
+            0.0025,
+        )
         if axis_filter is None:
             axis_filter = self._create_axis_filter(angle, params)
             setattr(self, attr_name, axis_filter)
+            self._axis_rate_initialized[attr_name] = False
+            self._record_axis_diagnostic(
+                attr_name,
+                "angle_initialized",
+                angle,
+                0.0,
+                axis_filter.covariance(),
+                predicted_angle=angle,
+                predicted_rate=0.0,
+            )
             return angle, 0.0, False
+
+        # 首次获得连续两帧有效量测时，用角度差分和陀螺补偿直接初始化
+        # 惯性 LOS 角速度，避免高速短航程中从零速度缓慢收敛。
+        if not self._axis_rate_initialized[attr_name] and measured_rate is not None:
+            max_initial_rate = _positive_value(
+                params.get("max_initial_rate_rad_s"),
+                10.0,
+            )
+            if _is_finite(measured_rate) and abs(measured_rate) <= max_initial_rate:
+                axis_filter = self._create_axis_filter(
+                    angle,
+                    params,
+                    measured_rate,
+                )
+                setattr(self, attr_name, axis_filter)
+                self._axis_rate_initialized[attr_name] = True
+                self._record_axis_diagnostic(
+                    attr_name,
+                    "rate_initialized",
+                    angle,
+                    measured_rate,
+                    axis_filter.covariance(),
+                    predicted_angle=angle,
+                    predicted_rate=measured_rate,
+                )
+                return angle, measured_rate, False
+
         self._predict_axis_filter(axis_filter, dt, params, gyro_rate_correction)
         state = axis_filter.state()
         covariance = axis_filter.covariance()
-        measurement_variance = _positive_value(params.get("measurement_angle_variance"), 0.0025)
         innovation_variance = covariance[0][0] + measurement_variance
         residual = angle - state[0]
+        predicted_angle = state[0]
+        predicted_rate = state[1]
         gate_sigma = _positive_value(params.get("innovation_gate_sigma"), 3.0)
         if innovation_variance <= EPS or residual * residual > gate_sigma * gate_sigma * innovation_variance:
-            axis_filter = self._create_axis_filter(angle, params)
+            # 高动态下大创新不代表目标必然错误。角度重新对齐当前视觉量测，
+            # 但保留已经估计出的惯性 LOS 角速度，避免反复清零后无法收敛。
+            preserved_rate = state[1]
+            axis_filter = self._create_axis_filter(
+                angle,
+                params,
+                preserved_rate,
+            )
             setattr(self, attr_name, axis_filter)
-            return angle, 0.0, True
+            self._record_axis_diagnostic(
+                attr_name,
+                "realigned",
+                angle,
+                preserved_rate,
+                axis_filter.covariance(),
+                predicted_angle=state[0],
+                predicted_rate=state[1],
+                residual=residual,
+                innovation_variance=innovation_variance,
+            )
+            return angle, preserved_rate, True
         state = axis_filter.update([angle])
+        self._axis_rate_initialized[attr_name] = True
+        self._record_axis_diagnostic(
+            attr_name,
+            "updated",
+            state[0],
+            state[1],
+            axis_filter.covariance(),
+            predicted_angle=predicted_angle,
+            predicted_rate=predicted_rate,
+            residual=residual,
+            innovation_variance=innovation_variance,
+        )
         return state[0], state[1], False
+
+    def _record_axis_diagnostic(
+        self,
+        attr_name,
+        mode,
+        angle,
+        rate,
+        covariance,
+        predicted_angle=None,
+        predicted_rate=None,
+        residual=None,
+        innovation_variance=None,
+    ):
+        """保存当前轴最近一次 Kalman 过程量，供逐帧日志和调参使用。"""
+        innovation_nis = None
+        if (
+            residual is not None
+            and innovation_variance is not None
+            and innovation_variance > EPS
+        ):
+            innovation_nis = residual * residual / innovation_variance
+        self._kalman_diagnostics[attr_name] = {
+            "mode": mode,
+            "rate_initialized": self._axis_rate_initialized.get(
+                attr_name,
+                False,
+            ),
+            "angle_rad": angle,
+            "rate_rad_s": rate,
+            "predicted_angle_rad": predicted_angle,
+            "predicted_rate_rad_s": predicted_rate,
+            "innovation_residual_rad": residual,
+            "innovation_variance_rad2": innovation_variance,
+            "innovation_nis": innovation_nis,
+            "covariance_angle_rad2": covariance[0][0],
+            "covariance_angle_rate": covariance[0][1],
+            "covariance_rate_rad2_s2": covariance[1][1],
+        }
 
     def _predict_axis_filter(self, axis_filter, dt, params, gyro_rate_correction=0.0):
         transition = [[1.0, dt], [0.0, 1.0]]
@@ -493,10 +675,10 @@ class ProportionalGuidance:
             process_noise=process_noise,
         )
 
-    def _create_axis_filter(self, angle, params):
+    def _create_axis_filter(self, angle, params, rate=0.0):
         # 状态速度是惯性 LOS rate；状态角是相对滚转稳定系的 LOS 角。
         return KalmanFilter(
-            state=[angle, 0.0],
+            state=[angle, rate],
             covariance=[[_positive_value(params.get("angle_variance"), 0.05), 0.0], [0.0, _positive_value(params.get("rate_variance"), 1.0)]],
             transition_matrix=[[1.0, 0.0], [0.0, 1.0]],
             measurement_matrix=[[1.0, 0.0]],

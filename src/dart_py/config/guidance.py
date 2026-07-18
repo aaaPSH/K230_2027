@@ -1,31 +1,36 @@
 """Guidance-law and command-generation parameters."""
 
 COMMON_KALMAN = {
-    "angle_variance": 0.05,
-    "rate_variance": 1.0,
+    # 首帧角度直接来自视觉量测，使用较小初始方差；速度保持较大不确定性，
+    # 配合连续两帧差分快速建立高速飞行初始 LOS rate。
+    "angle_variance": 0.0001,
+    "rate_variance": 10.0,
     # 状态为 [相对 LOS 角, 惯性 LOS 角速度]；陀螺补偿作为已知控制输入。
     # 此值是惯性 LOS 角加速度白噪声的谱密度。
-    "process_accel_variance": 0.02,
+    "process_accel_variance": 0.2,
     # 检测质心的像素标准差；运行时通过相机内参换算为角度量测方差。
     "measurement_noise_px": 1.0,
-    # 仅使用视觉 LOS 角量测，差分角速度不再作为伪独立量测输入。
-    "innovation_gate_sigma": 3.0,
+    # 差分角速度只用于两帧初始化，不作为后续 Kalman 伪独立量测。
+    "max_initial_rate_rad_s": 10.0,
+    "innovation_gate_sigma": 4.0,
 }
 
 YAW_KALMAN = {
-    "angle_variance": 0.05,
-    "rate_variance": 1.0,
-    "process_accel_variance": 0.02,
+    "angle_variance": 0.0001,
+    "rate_variance": 10.0,
+    "process_accel_variance": 0.2,
     "measurement_noise_px": 1.0,
-    "innovation_gate_sigma": 3.0,
+    "max_initial_rate_rad_s": 10.0,
+    "innovation_gate_sigma": 4.0,
 }
 
 PITCH_KALMAN = {
-    "angle_variance": 0.05,
-    "rate_variance": 1.0,
-    "process_accel_variance": 0.02,
+    "angle_variance": 0.0001,
+    "rate_variance": 10.0,
+    "process_accel_variance": 0.2,
     "measurement_noise_px": 1.0,
-    "innovation_gate_sigma": 3.0,
+    "max_initial_rate_rad_s": 10.0,
+    "innovation_gate_sigma": 4.0,
 }
 
 GUIDANCE_CONFIG = {
@@ -55,6 +60,6 @@ GUIDANCE_CONFIG = {
     "yaw_max_slew_g_s": 0.0,
     "pitch_max_slew_g_s": 0.0,
     # 视觉短时丢失最多预测 100 ms，超时后制导无效并输出零过载。
-    "max_prediction_time_s": 0.1,
+    "max_prediction_time_s": 0.04,
     "max_dt_sec": 0.2,
 }

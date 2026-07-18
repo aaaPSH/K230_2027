@@ -17,6 +17,7 @@ class OverloadCommandOutput:
 
     def __init__(self, config=None):
         self.config = config or {}
+        self.console_output = bool(self.config.get("console_output", False))
 
     def send_overload(self, command):
         """向下位机发送一个指令字典。默认实现为空操作。"""
@@ -31,16 +32,8 @@ class ConsoleCommandOutput(OverloadCommandOutput):
     """可选的调试输出，将指令字典打印到控制台。"""
 
     def send_overload(self, command):
-        print(
-            "cmd detected={} predicted={} valid={} pitch_g={:.3f} yaw_g={:.3f} fps={:.1f}".format(
-                command.get("detected", False),
-                command.get("predicted", False),
-                command.get("guidance_valid", False),
-                command.get("pitch_overload_g", 0.0),
-                command.get("yaw_overload_g", 0.0),
-                command.get("fps", 0.0),
-            )
-        )
+        if self.console_output:
+            _print_command(command)
         return True
 
 
@@ -83,6 +76,8 @@ class SerialCommandOutput(OverloadCommandOutput):
         if self.uart is None:
             return False
         self.uart.write(frame)
+        if self.console_output:
+            _print_command(command)
         return True
 
     def deinit(self):
@@ -158,8 +153,6 @@ def _mat_vec_mul(matrix, vector):
 
 
 def make_lower_computer_interface(config, uart=None):
-    if config.get("command_debug_print", False):
-        return ConsoleCommandOutput(config)
     command_config = config.get("command", {}).copy()
     if not command_config.get("enabled", True):
         return OverloadCommandOutput(config)
@@ -171,4 +164,22 @@ def make_lower_computer_interface(config, uart=None):
     # 当前默认 body=[imu_y, imu_x, -imu_z]，所以镖体 y/z 过载对应 IMU x/z。
     command_config.setdefault("lateral_imu_axis", 0)
     command_config.setdefault("normal_imu_axis", 2)
+    command_config["console_output"] = bool(
+        config.get("console", {}).get("command", False)
+    )
     return SerialCommandOutput(command_config or config, uart=uart)
+
+
+def _print_command(command):
+    """输出一帧精简指令调试信息。"""
+    print(
+        "cmd detected={} predicted={} valid={} pitch_g={:.3f} "
+        "yaw_g={:.3f} fps={:.1f}".format(
+            command.get("detected", False),
+            command.get("predicted", False),
+            command.get("guidance_valid", False),
+            command.get("pitch_overload_g", 0.0),
+            command.get("yaw_overload_g", 0.0),
+            command.get("fps", 0.0),
+        )
+    )

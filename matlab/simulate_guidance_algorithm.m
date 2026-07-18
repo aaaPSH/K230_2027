@@ -144,10 +144,10 @@ function cfg = default_guidance_config()
     cfg.rate_filter_alpha = NaN;
     cfg.use_kalman_filter = true;
 
-    cfg.kalman_angle_variance = 0.05;
-    cfg.kalman_rate_variance = 1.0;
+    cfg.kalman_angle_variance = 0.0001;
+    cfg.kalman_rate_variance = 10.0;
     cfg.kalman_process_angle_variance = 0.0001;
-    cfg.kalman_process_rate_variance = 0.02;
+    cfg.kalman_process_rate_variance = 0.2;
     cfg.kalman_measurement_noise_px = 1.0;
     cfg.kalman_yaw_measurement_angle_variance = ...
         atan(cfg.kalman_measurement_noise_px / cfg.fx)^2;

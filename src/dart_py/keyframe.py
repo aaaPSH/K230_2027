@@ -71,6 +71,8 @@ class KeyframeSaver:
         self._running = False
         self._writer_active = False
         self._write_error = None
+        self._reserved_frame_count = 0
+        self.dropped_frame_count = 0
         self._thread = None
 
         if self.enabled:
@@ -88,9 +90,20 @@ class KeyframeSaver:
 
     def save_if_needed(self, image, frame_index, image_timestamp_us):
         """按固定帧间隔复制当前带标注图像并交给后台保存。"""
+        reservation = self.reserve_if_needed(frame_index, image_timestamp_us)
+        return self.save_reserved(image, reservation)
+
+    def reserve_if_needed(self, frame_index, image_timestamp_us):
+        """为当前关键帧预留队列位置，返回保存路径或 ``None``。"""
         if not self.enabled:
             return None
-        self._raise_write_error()
+
+        write_error = self._get_write_error()
+        if write_error is not None:
+            # 关键帧仅用于诊断，写盘失败时自动停用，不能中断制导主循环。
+            self.enabled = False
+            self._debug("keyframe disabled after writer error={}".format(write_error))
+            return None
 
         if frame_index % self.interval_frames != 0:
             return None
@@ -100,21 +113,71 @@ class KeyframeSaver:
             int(frame_index),
             int(image_timestamp_us),
         )
-        # 原始图像在下一次 snapshot() 后可能被复用；只在关键帧复制，
-        # JPEG 编码和 SD 卡写入均在后台线程执行。
-        image_copy = image.copy()
         self._lock.acquire()
         try:
-            if len(self._pending_frames) >= self.max_pending_frames:
-                raise RuntimeError("keyframe writer queue is full")
-            self._pending_frames.append((image_copy, path))
-            pending_count = len(self._pending_frames)
+            occupied_count = len(self._pending_frames) + self._reserved_frame_count
+            if occupied_count >= self.max_pending_frames:
+                # 在复制和绘制图像前确认容量，避免队列满时做无效工作。
+                self.dropped_frame_count += 1
+                dropped_count = self.dropped_frame_count
+            else:
+                self._reserved_frame_count += 1
+                dropped_count = None
         finally:
             self._lock.release()
 
-        self._debug("keyframe queued pending={} path={}".format(pending_count, path))
-
+        if dropped_count is not None:
+            self._debug(
+                "keyframe dropped queue_full total_dropped={}".format(
+                    dropped_count
+                )
+            )
+            return None
         return path
+
+    def save_reserved(self, image, reservation):
+        """复制已预留的图像，并将其提交给后台 JPEG 写线程。"""
+        if reservation is None:
+            return None
+
+        # 原始图像在下一次 snapshot() 后可能被复用；队列位置已经预留，
+        # 因此不会发生复制完成后才因队列已满而丢弃的情况。
+        try:
+            image_copy = image.copy()
+        except Exception:
+            self._release_reservation()
+            raise
+
+        self._lock.acquire()
+        try:
+            self._reserved_frame_count -= 1
+            if self._write_error is not None:
+                pending_count = None
+            else:
+                self._pending_frames.append((image_copy, reservation))
+                pending_count = len(self._pending_frames)
+        finally:
+            self._lock.release()
+
+        if pending_count is None:
+            return None
+
+        self._debug(
+            "keyframe queued pending={} path={}".format(
+                pending_count,
+                reservation,
+            )
+        )
+
+        return reservation
+
+    def _release_reservation(self):
+        self._lock.acquire()
+        try:
+            if self._reserved_frame_count > 0:
+                self._reserved_frame_count -= 1
+        finally:
+            self._lock.release()
 
     def close(self):
         """等待后台线程写完排队关键帧。"""
@@ -132,7 +195,10 @@ class KeyframeSaver:
             if _ticks_diff(_ticks_ms(), deadline_ms) >= 0:
                 raise RuntimeError("keyframe writer did not stop before timeout")
             _sleep_ms(self.writer_poll_ms)
-        self._raise_write_error()
+        write_error = self._get_write_error()
+        if write_error is not None:
+            # 此时零过载已由主循环优先发送；这里只保留诊断，不阻断其他清理。
+            self._debug("keyframe closed with writer error={}".format(write_error))
 
     def _start_writer(self):
         if _thread is not None and hasattr(_thread, "start_new_thread"):
@@ -200,14 +266,12 @@ class KeyframeSaver:
             self._lock.release()
         self._debug("keyframe writer error={}".format(error))
 
-    def _raise_write_error(self):
+    def _get_write_error(self):
         self._lock.acquire()
         try:
-            error = self._write_error
+            return self._write_error
         finally:
             self._lock.release()
-        if error is not None:
-            raise RuntimeError("keyframe writer error: {}".format(error))
 
     def _debug(self, message):
         if self.debug_print:

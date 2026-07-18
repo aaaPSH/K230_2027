@@ -4,10 +4,23 @@
 """
 
 COMM_CONFIG = {
-    # 输出 FlightLogger 的全部字段，但频率受 diagnostics.period_ms 限制。
-    "debug_print": True,
-    # 仅在需要逐帧查看下发指令时启用；通常应保持关闭。
-    "command_debug_print": False,
+    # 控制台调试按功能独立开启，默认全部关闭。
+    "console": {
+        # 低频输出 FPS、各处理阶段耗时和 IMU 队列状态。
+        "runtime": False,
+        # 低频输出 FlightLogger 的全部遥测字段。
+        "telemetry": False,
+        # 低频单独输出 IMU 姿态、角速度、时效和故障状态。
+        "imu": False,
+        # 逐帧输出最终下发指令，频率高，仅在台架排错时开启。
+        "command": False,
+        # 输出飞行日志启动、停用和后台写入错误。
+        "flight_log": False,
+        # 输出关键帧入队、丢弃、保存和后台写入错误。
+        "keyframe": False,
+        # 输出主循环异常；开启后未处理异常还会显示 traceback。
+        "errors": False,
+    },
     "command": {
         "enabled": True,
         "uart_id": "UART1",
@@ -20,18 +33,19 @@ COMM_CONFIG = {
         "normal_imu_axis": 2,
     },
     "diagnostics": {
-        # debug_print 控制是否启用；此处仅配置输出周期。
-        "enabled": False,
+        # runtime、telemetry 和 imu 共用此输出周期。
         "period_ms": 1000,
     },
     "flight_log": {
         # 赛前可保持关闭；调参、飞行测试和赛后复盘时设为 True。
         "enabled": True,
         "directory": "/data/logs",
-        # 缓冲 60 帧后写入 SD 卡，避免逐帧文件 I/O 拖慢视觉回路。
+        # 每帧记录 54 个核心及 Kalman 调参字段，缓冲 60 帧后交给后台写入。
         "flush_interval_frames": 60,
         # 后台写线程轮询缓冲区的间隔；主视觉线程不执行日志文件写入。
         "writer_poll_ms": 10,
+        # 后台最多积压 8 个批次；写盘跟不上时丢弃日志，不阻塞制导。
+        "max_pending_buffers": 8,
         # 程序退出时等待后台写完最后一批日志的最长时间。
         "close_timeout_ms": 5000,
         "file_prefix": "flight",
@@ -46,8 +60,6 @@ COMM_CONFIG = {
         "max_pending_frames": 4,
         "writer_poll_ms": 10,
         "close_timeout_ms": 5000,
-        # 排错阶段输出关键帧启用、入队、保存成功及后台写入错误。
-        "debug_print": False,
     },
     "imu": {
         "enabled": True,
